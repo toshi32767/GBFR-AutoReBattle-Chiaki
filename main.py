@@ -108,7 +108,10 @@ class BattleSessionStats:
         self.stop_at_text = stop_at.strip()
         self.stop_at_timestamp = self._next_stop_timestamp(self.stop_at_text)
         self._lock = threading.Lock()
-        self.session_started_at: float | None = None
+        # Runtime limits measure the automation session itself, including time
+        # spent waiting for Chiaki/game state. Per-battle duration remains a
+        # separate timer started by ``start_battle``.
+        self.session_started_at: float | None = time()
         self.current_battle_started_at: float | None = None
         self.current_pause_started_at: float | None = None
         self.current_paused_seconds = 0.0
@@ -144,8 +147,6 @@ class BattleSessionStats:
     def start_battle(self) -> None:
         with self._lock:
             now = time()
-            if self.session_started_at is None:
-                self.session_started_at = now
             if self.current_battle_started_at is None:
                 self.current_battle_started_at = now
                 self.current_pause_started_at = None

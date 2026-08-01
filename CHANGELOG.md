@@ -36,3 +36,5 @@ redistribution. See `PUBLISH_BLOCKERS.md` before publishing source or binaries.
   changed.
 - Reduced statistics persistence and GUI refresh work from sub-second polling to
   one-second updates, and removed a duplicate statistics write per cycle.
+- Clarified runtime-limit semantics: the run timer starts when the automation
+  process starts, while each battle's duration remains a separate statistic.
