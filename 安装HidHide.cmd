@@ -2,13 +2,13 @@
 setlocal
 cd /d "%~dp0"
 if not exist "Dependencies\HidHide_1.4.202_x64.exe" (
-    echo 找不到官方 HidHide 安装程序。
+    echo ERROR: HidHide installer was not found.
     pause
     exit /b 1
 )
-echo 正在启动官方 HidHide 安装程序...
+echo Starting the official HidHide installer...
 start "" /wait "Dependencies\HidHide_1.4.202_x64.exe"
 echo.
-echo HidHide 安装程序已结束。
-echo 如需隔离实体手柄，请手动打开 HidHide Configuration Client 配置隐藏设备。
+echo HidHide installer has finished.
+echo Open HidHide Configuration Client manually if you need to hide a physical controller.
 pause
