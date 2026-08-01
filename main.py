@@ -1642,6 +1642,7 @@ def run_unified_gui(args) -> int:
         fg="#666",
         anchor="w",
         justify="left",
+        wraplength=760,
     ).grid(row=1, column=0, columnspan=7, padx=8, pady=(0, 6), sticky="ew")
 
     stats_frame = tk.LabelFrame(root, text="本轮挂机统计")
