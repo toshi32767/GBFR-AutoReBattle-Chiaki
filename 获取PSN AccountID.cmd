@@ -1,13 +1,20 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-set "APP=%~dp0GBFR_AutoReBattle.exe"
-if not exist "%APP%" set "APP=%~dp0GBFR.exe"
-if not exist "%APP%" set "APP=%~dp0GBFR_AutoReBattle\GBFR_AutoReBattle.exe"
-if not exist "%APP%" (
-    echo 找不到 GBFR_AutoReBattle.exe，请确认已完整解压当前文件夹。
-    pause
-    exit /b 1
-)
-"%APP%" --account-id
+if exist "%~dp0GBFR_AutoReBattle.exe" goto current
+if exist "%~dp0GBFR.exe" goto legacy
+if exist "%~dp0GBFR_AutoReBattle\GBFR_AutoReBattle.exe" goto nested
+echo ERROR: GBFR_AutoReBattle.exe was not found.
+echo Extract the complete package and run this file again.
+pause
+exit /b 1
+:current
+"%~dp0GBFR_AutoReBattle.exe" --account-id
+goto finish
+:legacy
+"%~dp0GBFR.exe" --account-id
+goto finish
+:nested
+"%~dp0GBFR_AutoReBattle\GBFR_AutoReBattle.exe" --account-id
+:finish
 if errorlevel 1 pause
