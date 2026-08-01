@@ -20,6 +20,7 @@ from module.controller import Controller, WindowsCapture, vg
 from module.log import Log, get_runtime_log_dir
 from module.psn_account import LOGIN_URL, account_id_from_redirect, run_account_id_prompt
 import argparse
+import math
 import numpy as np
 
 
@@ -42,7 +43,6 @@ REFOCUS_SEARCH_SECONDS = 1.0
 REFOCUS_STABILIZE_SECONDS = 1.5
 REFOCUS_CONFIRM_SAMPLES = 2
 REFOCUS_CONFIRM_INTERVAL_SECONDS = 0.5
-SHOW_SKILL_LOGS = False
 
 # Normalized centers of the top and right trigger skills in a 16:9 Chiaki frame.
 SKILL_TRIGGER_CENTERS = (
@@ -60,6 +60,7 @@ SKILL_MONITOR_ACTIVE_POLL_SECONDS = 1.0
 AUTOMATION_INPUT_LOCK = threading.Lock()
 _CAPTURE_UNAVAILABLE_WARNED = False
 SESSION_STATS = None
+SCHEDULE_FILE: Path | None = None
 
 
 def decode_console_bytes(data: bytes) -> tuple[str, bytes]:
@@ -207,6 +208,24 @@ class BattleSessionStats:
                 return f"已到设定时间 {self.stop_at_text}"
             return None
 
+    def update_limits(
+        self,
+        max_battles: int,
+        max_runtime_minutes: float,
+        stop_at: str,
+    ) -> None:
+        """Apply GUI changes without restarting the automation child."""
+        if max_battles < 0 or not math.isfinite(max_runtime_minutes) or max_runtime_minutes < 0:
+            raise ValueError("自动结束设置必须是非负数字")
+        if stop_at:
+            datetime.strptime(stop_at, "%H:%M")
+        with self._lock:
+            self.max_battles = int(max_battles)
+            self.max_runtime_seconds = float(max_runtime_minutes) * 60.0
+            self.stop_at_text = stop_at.strip()
+            self.stop_at_timestamp = self._next_stop_timestamp(self.stop_at_text)
+            self._write_locked()
+
     def stop(self, reason: str) -> None:
         with self._lock:
             self.stop_reason = reason
@@ -271,8 +290,25 @@ def _stats_finish_battle() -> float | None:
 
 def _stats_watchdog(relink: Controller) -> None:
     """Refresh the JSON panel and stop cleanly when a configured limit hits."""
+    schedule_mtime: int | None = None
     while not relink.shutdown_requested:
         if SESSION_STATS is not None:
+            if SCHEDULE_FILE is not None:
+                try:
+                    current_mtime = SCHEDULE_FILE.stat().st_mtime_ns
+                    if current_mtime != schedule_mtime:
+                        schedule_mtime = current_mtime
+                        schedule_data = json.loads(
+                            SCHEDULE_FILE.read_text(encoding="utf-8")
+                        )
+                        SESSION_STATS.update_limits(
+                            int(schedule_data.get("max_battles", 0) or 0),
+                            float(schedule_data.get("max_runtime_minutes", 0) or 0),
+                            str(schedule_data.get("stop_at", "") or "").strip(),
+                        )
+                        log.info("已应用自动结束设置（运行中修改立即生效）")
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                    log.warning("自动结束设置读取失败，沿用当前设置：%s", exc)
             SESSION_STATS.sync_controller_state(relink.running, relink.paused)
             reason = SESSION_STATS.reached_limit()
             if reason and relink.running:
@@ -280,8 +316,7 @@ def _stats_watchdog(relink: Controller) -> None:
                 log.warning("达到自动结束条件：%s", reason)
                 relink.request_shutdown()
                 return
-            SESSION_STATS.refresh()
-        sleep(0.5)
+        sleep(1.0)
 
 
 def close_chiaki_for_title(title: str) -> None:
@@ -454,8 +489,7 @@ def skill_trigger_slots_bright(relink: Controller) -> tuple[bool, list[float]]:
     pixels = np.asarray(combined, dtype=np.uint8)
     values: list[float] = []
     bright_states: list[bool] = []
-    diagnostic_values: list[tuple[str, float, float, float, bool]] = []
-    for slot_name, (center_x, center_y) in zip(("上方", "右侧"), centers):
+    for center_x, center_y in centers:
         local_x = center_x - crop_left
         local_y = center_y - crop_top
         patch = pixels[
@@ -482,19 +516,6 @@ def skill_trigger_slots_bright(relink: Controller) -> tuple[bool, list[float]]:
             )
         )
         bright_states.append(is_bright)
-        diagnostic_values.append(
-            (slot_name, brightness, blue_chroma, brightness_p95, is_bright)
-        )
-
-    if SHOW_SKILL_LOGS:
-        log.debug(
-            "技能采样 | %s",
-            " | ".join(
-                f"{name}: 亮度={brightness:.1f}, 蓝紫色差={chroma:.1f}, "
-                f"P95={p95:.1f}, 判定={'亮' if bright else '暗'}"
-                for name, brightness, chroma, p95, bright in diagnostic_values
-            ),
-        )
 
     return any(bright_states), values
 
@@ -518,29 +539,17 @@ def focus_watchdog(relink: Controller, battle_is_active: Callable[[], bool]) -> 
             continue
 
         try:
-            trigger_bright, values = skill_trigger_slots_bright(relink)
+            trigger_bright, _ = skill_trigger_slots_bright(relink)
             now = time()
 
             if trigger_bright:
                 dim_since = None
                 if bright_since is None:
                     bright_since = now
-                    if SHOW_SKILL_LOGS:
-                        log.debug(
-                            "上方或右侧技能高亮，开始 %.0f 秒失焦计时: %s",
-                            REFOCUS_SECONDS,
-                            [round(v, 1) for v in values],
-                        )
             elif bright_since is not None:
                 if dim_since is None:
                     dim_since = now
                 elif now - dim_since >= SKILL_TRIGGER_DIM_GRACE_SECONDS:
-                    if SHOW_SKILL_LOGS:
-                        log.debug(
-                            "上方/右侧技能连续变暗 %.0f 秒，重置失焦计时: %s",
-                            SKILL_TRIGGER_DIM_GRACE_SECONDS,
-                            [round(v, 1) for v in values],
-                        )
                     bright_since = None
                     dim_since = None
 
@@ -923,11 +932,6 @@ def parse_args():
         help="上方或右侧技能持续高亮多少秒后恢复索敌，默认 15",
     )
     parser.add_argument(
-        "--show-skill-logs",
-        action="store_true",
-        help="显示技能亮度监控的调试明细（默认隐藏）",
-    )
-    parser.add_argument(
         "--max-battles",
         type=int,
         default=0,
@@ -942,7 +946,12 @@ def parse_args():
     parser.add_argument(
         "--stop-at",
         default="",
-        help="每天到达 HH:MM 后自动停止并关闭 Chiaki，例如 23:30",
+        help="本机时钟到达 HH:MM 后自动停止并关闭 Chiaki，例如 23:30",
+    )
+    parser.add_argument(
+        "--schedule-file",
+        default=None,
+        help="运行中读取自动结束设置的 JSON 文件；统一界面会自动传入",
     )
     parser.add_argument(
         "--stats-file",
@@ -1059,6 +1068,7 @@ def run_unified_gui(args) -> int:
     log_pending = {"value": b""}
     settings_path = Path(get_runtime_log_dir()).parent / "settings.json"
     stats_path = Path(get_runtime_log_dir()) / "session-stats.json"
+    schedule_path = Path(get_runtime_log_dir()) / "schedule.json"
 
     def load_gui_settings() -> dict[str, object]:
         try:
@@ -1077,6 +1087,13 @@ def run_unified_gui(args) -> int:
         saved_background = bool(args.background)
 
     background = tk.BooleanVar(value=saved_background)
+    background_label = tk.StringVar(
+        value=(
+            "后台运行（已勾选；启动后会锁定，停止后可取消）"
+            if saved_background
+            else "后台运行（勾选后启用；运行中锁定，停止后可取消）"
+        )
+    )
     status = tk.StringVar(
         value=(
             "就绪：已选择后台模式（启动前将检查环境）"
@@ -1084,7 +1101,6 @@ def run_unified_gui(args) -> int:
             else "就绪：已选择前台模式"
         )
     )
-    show_skill_logs = tk.BooleanVar(value=False)
     invert_movement = tk.BooleanVar(value=False)
     title_var = tk.StringVar(value=args.window_title)
     path_var = tk.StringVar(value=args.chiaki_exe or "Chiaki\\chiaki.exe")
@@ -1122,13 +1138,32 @@ def run_unified_gui(args) -> int:
             else "已选择前台模式；自动按键会激活 Chiaki"
         )
 
+    def write_schedule_file(schedule: tuple[int, float, str]) -> None:
+        """Persist the live automatic-stop settings for the child process."""
+        max_battles, max_runtime, stop_at = schedule
+        payload = {
+            "max_battles": max_battles,
+            "max_runtime_minutes": max_runtime,
+            "stop_at": stop_at,
+        }
+        try:
+            schedule_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = schedule_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temporary, schedule_path)
+        except OSError as exc:
+            raise OSError(f"无法保存自动结束设置：{exc}") from exc
+
     def read_schedule() -> tuple[int, float, str] | None:
         """Validate the three optional automatic-stop controls."""
         try:
             max_battles = int(max_battles_var.get().strip() or "0")
             max_runtime = float(max_runtime_var.get().strip() or "0")
             stop_at = stop_at_var.get().strip()
-            if max_battles < 0 or max_runtime < 0:
+            if max_battles < 0 or not math.isfinite(max_runtime) or max_runtime < 0:
                 raise ValueError
             if stop_at:
                 datetime.strptime(stop_at, "%H:%M")
@@ -1136,10 +1171,31 @@ def run_unified_gui(args) -> int:
         except ValueError:
             messagebox.showerror(
                 "定时设置无效",
-                "场数和运行分钟必须是非负数字；每日时间请填写 HH:MM，例如 23:30。",
+                "完成场数和运行时长必须是非负数字；自动关闭时间请填写 HH:MM，例如 23:30。",
                 parent=root,
             )
             return None
+
+    def apply_schedule() -> None:
+        schedule = read_schedule()
+        if schedule is None:
+            return
+        try:
+            write_schedule_file(schedule)
+            save_background_choice()
+        except OSError as exc:
+            messagebox.showerror("自动结束设置未保存", str(exc), parent=root)
+            return
+        max_battles, max_runtime, stop_at = schedule
+        enabled = []
+        if max_battles:
+            enabled.append(f"{max_battles} 场")
+        if max_runtime:
+            enabled.append(f"{max_runtime:g} 分钟")
+        if stop_at:
+            enabled.append(f"本机时间 {stop_at}")
+        description = "、".join(enabled) if enabled else "未启用任何自动结束条件"
+        set_status(f"自动结束设置已应用：{description}；运行中修改立即生效")
 
     def app_root() -> Path:
         return Path(
@@ -1149,14 +1205,13 @@ def run_unified_gui(args) -> int:
     def show_chiaki_mapping_hint() -> None:
         messagebox.showinfo(
             "Chiaki 按键配置提示",
-            "请在 Chiaki 的 Settings / Keyboard Mapping 中确认：\n\n"
-            "W = Left Stick Up        S = Left Stick Down\n"
-            "A = Left Stick Left      D = Left Stick Right\n"
-            "Q = Right Stick Left     E = Right Stick Right\n"
-            "Return = Cross           \\ = Square\n"
-            "L = L2                   3 = R1\n\n"
-            "不要把 Touchpad 映射为 L2；工具的索敌键是 L2。\n"
-            "后台模式只需要确认这套映射一次，之后可把其他窗口覆盖在 Chiaki 上。",
+            "请在 Chiaki 的 Settings / Keyboard Mapping 中修改以下按键：\n\n"
+            "W → Left Stick Up        S → Left Stick Down\n"
+            "A → Left Stick Left      D → Left Stick Right\n"
+            "Q → Right Stick Left     E → Right Stick Right\n"
+            "Return → Cross           \\ → Square\n"
+            "L → L2                   3 → R1\n\n"
+            "以上按键需要按此设置；其他按键保持默认即可。",
             parent=root,
         )
 
@@ -1290,7 +1345,7 @@ def run_unified_gui(args) -> int:
                     log_cursor["value"] = handle.tell()
         except OSError:
             pass
-        root.after(250, poll_console_log)
+        root.after(500, poll_console_log)
 
     def start_chiaki() -> None:
         if chiaki_process["value"] is not None and chiaki_process["value"].poll() is None:
@@ -1327,7 +1382,12 @@ def run_unified_gui(args) -> int:
         if schedule is None:
             return
         max_battles, max_runtime, stop_at = schedule
-        save_background_choice()
+        try:
+            write_schedule_file(schedule)
+            save_background_choice()
+        except OSError as exc:
+            messagebox.showerror("自动结束设置未保存", str(exc), parent=root)
+            return
         if run_in_background and not check_background_environment(show_dialog=True):
             return
         if chiaki_process["value"] is None or chiaki_process["value"].poll() is not None:
@@ -1347,10 +1407,9 @@ def run_unified_gui(args) -> int:
             command.extend(("--max-runtime-minutes", str(max_runtime)))
         if stop_at:
             command.extend(("--stop-at", stop_at))
-        if show_skill_logs.get():
-            command.append("--show-skill-logs")
         if invert_movement.get():
             command.append("--invert-movement")
+        command.extend(("--schedule-file", str(schedule_path)))
         try:
             log_dir = Path(get_runtime_log_dir())
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -1383,6 +1442,11 @@ def run_unified_gui(args) -> int:
             )
             active_background_mode["value"] = run_in_background
             background_check.configure(state="disabled")
+            background_label.set(
+                "后台运行（当前已启用并锁定；先停止自动重战，再取消勾选即可前台运行）"
+                if run_in_background
+                else "后台运行（当前未启用；运行中锁定，停止后可勾选）"
+            )
             if run_in_background:
                 set_status("自动重战已启动：后台模式中，Chiaki 可以被覆盖但不要最小化")
             else:
@@ -1402,7 +1466,10 @@ def run_unified_gui(args) -> int:
         automation_process["value"] = None
         active_background_mode["value"] = None
         background_check.configure(state="normal")
-        set_status("自动重战已停止")
+        background_label.set(
+            "后台运行（勾选后启用；运行中锁定，停止后可取消）"
+        )
+        set_status("自动重战已停止；现在可以取消“后台运行”勾选，改为前台运行")
 
     def send_automation_hotkey(vk: int) -> None:
         """Send a global F3/F2 command to the elevated automation child."""
@@ -1419,6 +1486,8 @@ def run_unified_gui(args) -> int:
 
     def toggle_pause() -> None:
         send_automation_hotkey(0x72)  # F3
+
+    stats_table_signature = {"value": None}
 
     def poll_stats() -> None:
         try:
@@ -1439,21 +1508,31 @@ def run_unified_gui(args) -> int:
                     f"状态：{data.get('status', '未知')}  |  当前场耗时：{_format_duration(current)}  |  "
                     f"最快 {_format_duration(shortest)}  |  最慢 {_format_duration(longest)}"
                 )
-                battle_table.delete(*battle_table.get_children())
                 battles = data.get("battles", [])
-                for item in battles[-30:]:
-                    battle_table.insert(
-                        "",
-                        "end",
-                        values=(
-                            item.get("number", ""),
-                            _format_duration(item.get("duration_seconds")),
-                            item.get("ended_at", ""),
-                        ),
+                table_rows = tuple(
+                    (
+                        item.get("number", ""),
+                        item.get("duration_seconds"),
+                        item.get("ended_at", ""),
                     )
+                    for item in battles[-30:]
+                )
+                if table_rows != stats_table_signature["value"]:
+                    battle_table.delete(*battle_table.get_children())
+                    for item in battles[-30:]:
+                        battle_table.insert(
+                            "",
+                            "end",
+                            values=(
+                                item.get("number", ""),
+                                _format_duration(item.get("duration_seconds")),
+                                item.get("ended_at", ""),
+                            ),
+                        )
+                    stats_table_signature["value"] = table_rows
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             pass
-        root.after(500, poll_stats)
+        root.after(1000, poll_stats)
 
     def account_id() -> None:
         webbrowser.open(LOGIN_URL)
@@ -1491,8 +1570,12 @@ def run_unified_gui(args) -> int:
         if process is not None and process.poll() is not None:
             exit_code = process.returncode
             automation_process["value"] = None
+            was_background = active_background_mode["value"] is True
             active_background_mode["value"] = None
             background_check.configure(state="normal")
+            background_label.set(
+                "后台运行（勾选后启用；运行中锁定，停止后可取消）"
+            )
             if automation_output["value"] is not None:
                 automation_output["value"].close()
                 automation_output["value"] = None
@@ -1510,6 +1593,13 @@ def run_unified_gui(args) -> int:
                 set_status(
                     f"自动重战异常退出（退出码 {exit_code}）；详细信息见下方运行日志"
                 )
+            if was_background:
+                if stop_reason:
+                    set_status(
+                        f"自动重战已按计划结束：{stop_reason}；如需前台运行，请取消“后台运行”后重新启动"
+                    )
+                else:
+                    set_status("自动重战已结束；如需前台运行，请取消“后台运行”后重新启动")
         root.after(500, poll_processes)
 
     tk.Label(root, text="Chiaki 程序").grid(row=0, column=0, padx=12, pady=(14, 6), sticky="w")
@@ -1520,14 +1610,13 @@ def run_unified_gui(args) -> int:
     tk.Button(root, text="按键配置提示", command=show_chiaki_mapping_hint, width=14).grid(row=1, column=2, padx=12, pady=6)
     background_check = tk.Checkbutton(
         root,
-        text="后台运行（独立保存；允许其他窗口覆盖 Chiaki，不要最小化）",
+        textvariable=background_label,
         variable=background,
         command=save_background_choice,
     )
     background_check.grid(row=2, column=0, columnspan=3, padx=12, pady=6, sticky="w")
     tk.Button(root, text="检查后台环境", command=check_background_environment, width=16).grid(row=3, column=0, padx=12, pady=(2, 6))
     tk.Button(root, text="安装虚拟手柄驱动", command=install_virtual_gamepad_driver, width=18).grid(row=3, column=1, padx=8, pady=(2, 6), sticky="w")
-    tk.Checkbutton(root, text="显示技能监控明细", variable=show_skill_logs).grid(row=3, column=2, padx=8, pady=(2, 6), sticky="w")
     tk.Button(root, text="启动自动重战", command=start_automation, width=16).grid(row=4, column=0, padx=12, pady=8)
     tk.Button(root, text="暂停/继续（F3）", command=toggle_pause, width=16).grid(row=4, column=1, padx=8, pady=8, sticky="w")
     tk.Button(root, text="停止自动重战", command=stop_automation, width=16).grid(row=4, column=2, padx=12, pady=8)
@@ -1535,18 +1624,25 @@ def run_unified_gui(args) -> int:
     tk.Button(root, text="打开日志目录", command=open_logs, width=16).grid(row=5, column=1, padx=8, pady=(0, 6), sticky="w")
     tk.Checkbutton(root, text="反向移动方向（仅后台客户机方向相反时）", variable=invert_movement).grid(row=5, column=2, padx=8, pady=(0, 6), sticky="w")
 
-    schedule_frame = tk.LabelFrame(root, text="自动结束条件（留空或填 0 表示不启用；任一条件满足即关闭 Chiaki）")
+    schedule_frame = tk.LabelFrame(root, text="自动结束设置（点击“应用设置”后生效，运行中修改也会生效）")
     schedule_frame.grid(row=6, column=0, columnspan=3, padx=12, pady=(2, 6), sticky="ew")
     schedule_frame.columnconfigure(1, weight=1)
     schedule_frame.columnconfigure(3, weight=1)
     schedule_frame.columnconfigure(5, weight=1)
-    tk.Label(schedule_frame, text="完成场数").grid(row=0, column=0, padx=(8, 4), pady=6)
+    tk.Label(schedule_frame, text="完成场数后关闭").grid(row=0, column=0, padx=(8, 4), pady=6)
     tk.Entry(schedule_frame, textvariable=max_battles_var, width=8).grid(row=0, column=1, padx=(0, 12), pady=6, sticky="w")
-    tk.Label(schedule_frame, text="运行分钟").grid(row=0, column=2, padx=(8, 4), pady=6)
+    tk.Label(schedule_frame, text="运行时长（分钟）").grid(row=0, column=2, padx=(8, 4), pady=6)
     tk.Entry(schedule_frame, textvariable=max_runtime_var, width=8).grid(row=0, column=3, padx=(0, 12), pady=6, sticky="w")
-    tk.Label(schedule_frame, text="每日时间").grid(row=0, column=4, padx=(8, 4), pady=6)
+    tk.Label(schedule_frame, text="自动关闭时间").grid(row=0, column=4, padx=(8, 4), pady=6)
     tk.Entry(schedule_frame, textvariable=stop_at_var, width=8).grid(row=0, column=5, padx=(0, 8), pady=6, sticky="w")
-    tk.Label(schedule_frame, text="例：10 场 / 120 分钟 / 23:30", fg="#666").grid(row=0, column=6, padx=8, pady=6, sticky="w")
+    tk.Button(schedule_frame, text="应用设置", command=apply_schedule, width=12).grid(row=0, column=6, padx=(4, 8), pady=6)
+    tk.Label(
+        schedule_frame,
+        text="时间格式 HH:MM，按本机时钟；已过该时间则按次日。留空或 0 表示不启用，任一条件满足即关闭 Chiaki。",
+        fg="#666",
+        anchor="w",
+        justify="left",
+    ).grid(row=1, column=0, columnspan=7, padx=8, pady=(0, 6), sticky="ew")
 
     stats_frame = tk.LabelFrame(root, text="本轮挂机统计")
     stats_frame.grid(row=7, column=0, columnspan=3, padx=12, pady=(0, 6), sticky="nsew")
@@ -1590,8 +1686,8 @@ def run_unified_gui(args) -> int:
 
     root.protocol("WM_DELETE_WINDOW", close)
     root.after(500, poll_processes)
-    root.after(250, poll_console_log)
-    root.after(500, poll_stats)
+    root.after(500, poll_console_log)
+    root.after(1000, poll_stats)
     root.mainloop()
     return 0
 
@@ -1626,6 +1722,7 @@ if __name__ == "__main__":
 
     log = Log("GBFR", "i").logger
     stats_path = Path(args.stats_file) if args.stats_file else Path(get_runtime_log_dir()) / "session-stats.json"
+    SCHEDULE_FILE = Path(args.schedule_file) if args.schedule_file else None
     try:
         SESSION_STATS = BattleSessionStats(
             stats_path,
@@ -1648,7 +1745,6 @@ if __name__ == "__main__":
     # Keep the selected L2 mapping available to both battle-loop variants.
     L2_KEY = args.l2_key
     REFOCUS_SECONDS = max(5.0, args.refocus_seconds)
-    SHOW_SKILL_LOGS = args.show_skill_logs
     relink.set_battle_start_key("f1")
     relink.set_battle_stop_key("f2")
     relink.set_battle_pause_key("f3")

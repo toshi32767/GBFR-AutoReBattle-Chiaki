@@ -24,6 +24,7 @@ chiaki-src/
 build/
 dist/
 build-pyinstaller/*
+build-pyinstaller-v*/
 dist-pyinstaller/
 release/
 release-v*/

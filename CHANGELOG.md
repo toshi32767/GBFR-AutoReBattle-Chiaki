@@ -22,3 +22,17 @@ uses semantic versioning; the older local build number is retained for support.
 
 This is a private release candidate, not authorization for public
 redistribution. See `PUBLISH_BLOCKERS.md` before publishing source or binaries.
+
+## Post-V26 maintenance
+
+- Replaced the ambiguous automatic-stop labels with an explicit applyable
+  settings panel: completed battles, runtime in minutes, and local-clock close
+  time (`HH:MM`). Changes can be applied while a run is active.
+- Removed the skill-monitor detail switch and its high-frequency diagnostic
+  lines; detection remains enabled internally.
+- Added clear background-mode lock text explaining that stopping the run and
+  clearing the checkbox switches back to foreground operation.
+- Simplified the Chiaki mapping dialog to list only the keys that must be
+  changed.
+- Reduced statistics persistence and GUI refresh work from sub-second polling to
+  one-second updates, and removed a duplicate statistics write per cycle.
