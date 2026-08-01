@@ -44,5 +44,11 @@ redistribution. See `PUBLISH_BLOCKERS.md` before publishing source or binaries.
   launchers. HidHide is never required by the background check and is never
   configured automatically.
 - Fixed pause/resume race conditions: F3 resume now releases all inputs,
-  briefly blocks forward movement, and rechecks `RES`/`继续` before the battle
-  movement worker is allowed to resume.
+  briefly blocks forward movement, and rechecks the real `继续` and
+  `再次挑战/撤销` result controls before the movement worker can resume.
+- Removed the previously added upper-left result-heading crop. Battle-end and
+  restart recovery now use only the existing result controls shown in the
+  captured gameplay.
+- Reduced perceived log startup latency: launcher status is displayed
+  immediately, child output is unbuffered, polling runs every 250 ms, and the
+  heavy OCR import happens after a visible progress message.

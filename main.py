@@ -635,6 +635,35 @@ def press_verified_result_continue(relink: Controller) -> bool:
     return True
 
 
+def detect_stable_result_ui(relink: Controller) -> str | None:
+    """Detect the real result controls using bottom-left/right UI prompts."""
+    if relink.paused:
+        return None
+
+    continue_text = read_region_text(relink, "继续")
+    repeat_text = read_region_text(relink, "再次")
+    continue_found = "继续" in continue_text
+    repeat_found = "再次" in repeat_text or "撤销" in repeat_text
+
+    # Two independent controls on the same result frame are already strong
+    # evidence.  If only one OCR crop matches, verify it on a fresh frame.
+    if continue_found and repeat_found:
+        return "继续+再次挑战"
+    if not continue_found and not repeat_found:
+        return None
+
+    sleep(0.55)
+    if relink.paused:
+        return None
+    if continue_found and "继续" in read_region_text(relink, "继续"):
+        return "继续"
+    if repeat_found:
+        repeat_text = read_region_text(relink, "再次")
+        if "再次" in repeat_text or "撤销" in repeat_text:
+            return "再次挑战/撤销"
+    return None
+
+
 def settlement_confirmation_selection(relink: Controller) -> str | None:
     """Read the selected row in the result confirmation dialog by its blue bar."""
     frame = relink.screenshot()
@@ -777,10 +806,9 @@ def relink_battle(relink: Controller) -> None:
                 relink.release_automation_inputs()
             log.info("暂停已解除：先重新检查结算标记，再恢复战斗推进")
             if phase == "battle_active":
-                if "RES" in read_region_text(relink, "RES"):
-                    transition_to_result()
-                    continue
-                if "继续" in read_region_text(relink, "继续"):
+                result_marker = detect_stable_result_ui(relink)
+                if result_marker:
+                    log.info("恢复后识别到结算控件：%s", result_marker)
                     transition_to_result()
                     continue
             # For the normal result phase, fall through immediately so the
@@ -793,19 +821,20 @@ def relink_battle(relink: Controller) -> None:
                 enter_battle()
                 continue
             # Allow starting/restarting the tool while a result screen is open.
-            if "RES" in read_region_text(relink, "RES"):
+            result_marker = detect_stable_result_ui(relink)
+            if result_marker:
                 phase = "result"
                 with AUTOMATION_INPUT_LOCK:
                     relink.release_automation_inputs()
-                log.info("识别到 BATTLE RESULTS，恢复到结算阶段")
+                log.info("识别到结算控件 %s，恢复到结算阶段", result_marker)
                 continue
             sleep(1.0)
             continue
 
         if phase == "battle_active":
-            # V6's stable battle-end marker.  One OCR per second is sufficient
-            # for a screen that remains visible until user input.
-            if "RES" in read_region_text(relink, "RES"):
+            result_marker = detect_stable_result_ui(relink)
+            if result_marker:
+                log.info("识别到结算控件：%s", result_marker)
                 transition_to_result()
                 continue
             sleep(1.0)
@@ -891,14 +920,14 @@ def relink_battle_silent(relink: Controller):
                 with AUTOMATION_INPUT_LOCK:
                     relink.press(L2_KEY)
                 continue
-            if "RES" in read_region_text(relink, "RES"):
+            if detect_stable_result_ui(relink):
                 phase = "result"
                 continue
             sleep(1.0)
             continue
 
         if phase == "battle_active":
-            if "RES" in read_region_text(relink, "RES"):
+            if detect_stable_result_ui(relink):
                 battle_active = False
                 phase = "result"
                 _stats_finish_battle()
@@ -1436,7 +1465,7 @@ def run_unified_gui(args) -> int:
                     log_cursor["value"] = handle.tell()
         except OSError:
             pass
-        root.after(500, poll_console_log)
+        root.after(250, poll_console_log)
 
     def start_chiaki() -> None:
         if chiaki_process["value"] is not None and chiaki_process["value"].poll() is None:
@@ -1515,15 +1544,21 @@ def run_unified_gui(args) -> int:
             # import/startup tracebacks are captured in the same live view.
             # Keep the child pipe explicitly UTF-8 on Windows. The BOM makes
             # the persisted console log readable outside this GUI as well.
-            automation_output["value"] = console_log.open("w", encoding="utf-8-sig")
+            automation_output["value"] = console_log.open(
+                "w", encoding="utf-8-sig", buffering=1
+            )
             child_env = os.environ.copy()
             child_env["PYTHONUTF8"] = "1"
             child_env["PYTHONIOENCODING"] = "utf-8"
+            child_env["PYTHONUNBUFFERED"] = "1"
             log_mode = "后台 ViGEm DS4" if run_in_background else "前台键盘"
-            automation_output["value"].write(
-                f"[启动器] 本次运行模式：{log_mode}\n"
-            )
+            launcher_line = f"[启动器] 本次运行模式：{log_mode}；正在启动自动化子进程...\n"
+            automation_output["value"].write(launcher_line)
             automation_output["value"].flush()
+            # Display launcher progress immediately and start polling after
+            # these bytes so the same line is not appended twice.
+            log_cursor["value"] = console_log.stat().st_size
+            append_console_log(launcher_line)
             automation_process["value"] = subprocess.Popen(
                 command,
                 stdout=automation_output["value"],
@@ -1779,7 +1814,7 @@ def run_unified_gui(args) -> int:
 
     root.protocol("WM_DELETE_WINDOW", close)
     root.after(500, poll_processes)
-    root.after(500, poll_console_log)
+    root.after(250, poll_console_log)
     root.after(1000, poll_stats)
     root.mainloop()
     return 0
@@ -1809,8 +1844,6 @@ if __name__ == "__main__":
         # The result continuation prompt is a small, stable bottom-right
         # label.  Keeping this crop narrow avoids OCR of the full rewards UI.
         "继续": [0.87, 0.92, 0.92, 0.98],
-        "RES": [0.0543, 0.0377, 0.435, 0.1055],
-        
     }
 
     log = Log("GBFR", "i").logger

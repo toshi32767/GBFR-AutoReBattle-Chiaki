@@ -11,7 +11,6 @@ import win32gui
 import win32ui
 from PIL import Image, ImageGrab
 from module.log import Log, setup_project_log
-from module.rapidocr_onnxruntime import RapidOCR
 import numpy as np
 
 try:
@@ -149,6 +148,11 @@ class Controller:
             self._hotkey_thread: threading.Thread | None = None
             logical_cpus = os.cpu_count() or 1
             ocr_threads = 1 if logical_cpus <= 8 else 2
+            _log.info("正在加载 OCR 识别引擎，请稍候...")
+            # ONNX Runtime is the heaviest child-process import. Loading it
+            # here lets the live logger report progress before that work.
+            from module.rapidocr_onnxruntime import RapidOCR
+
             # Fixed-position markers use recognition-only OCR. Detection and
             # orientation models stay unloaded unless a legacy full-OCR call
             # actually requests them.
