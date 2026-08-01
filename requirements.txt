@@ -1,0 +1,12 @@
+pywin32==312
+numpy
+Pillow
+PyYAML
+onnxruntime>=1.7.0
+Shapely>=1.7.1,!=2.0.4
+pyclipper>=1.2.0
+lazy_loader
+scikit-image
+windows-capture>=2.0.0
+requests>=2.31.0
+vgamepad==0.1.0

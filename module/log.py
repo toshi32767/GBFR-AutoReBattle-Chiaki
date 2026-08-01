@@ -1,0 +1,286 @@
+import atexit
+import ctypes
+import logging
+import os
+import sys
+import re
+import tempfile
+from datetime import datetime
+
+
+# ============================================================
+#  应用根目录（兼容 PyInstaller 单文件打包）
+# ============================================================
+def get_app_root() -> str:
+    """返回 EXE / py 文件所在的真实目录
+
+    Nuitka onefile 模式会用引导程序解包到临时目录运行，此时
+    sys.executable 指向临时目录里的 exe 副本（非原始 exe），
+    因此必须用 sys.argv[0] 才能拿到用户实际运行的原始 exe 路径。
+    """
+    # sys.argv[0]：onefile/standalone/PyInstaller 下是原始 exe 路径；
+    #              普通 Python 下是启动脚本（main.py）路径
+    argv0 = os.path.abspath(sys.argv[0])
+    base = os.path.basename(argv0).lower()
+
+    # 极少数情况下 argv[0] 指向 python 解释器，回退到 __file__ 推导
+    if base in ("python.exe", "pythonw.exe", "python3.exe"):
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    return os.path.dirname(argv0)
+
+
+def get_runtime_data_root() -> str:
+    """Return a user-writable directory for logs and other runtime state.
+
+    The portable package can be launched from Downloads, a network share, or
+    a chat client's received-files folder. Those locations are not reliable
+    write targets, so runtime data must never depend on the EXE directory.
+    """
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return os.path.join(local_app_data, "GBFR-AutoReBattle")
+    return os.path.join(tempfile.gettempdir(), "GBFR-AutoReBattle")
+
+
+def _runtime_log_dir_candidates(preferred: str | None = None) -> list[str]:
+    """Build ordered, de-duplicated writable-directory candidates."""
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
+    candidates.extend(
+        (
+            os.path.join(get_runtime_data_root(), "logs"),
+            os.path.join(tempfile.gettempdir(), "GBFR-AutoReBattle", "logs"),
+            os.path.join(get_app_root(), "logs"),
+        )
+    )
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key not in seen:
+            result.append(candidate)
+            seen.add(key)
+    return result
+
+
+def get_runtime_log_dir() -> str:
+    """Return a usable log directory, preferring LocalAppData."""
+    candidates = _runtime_log_dir_candidates()
+    for candidate in candidates:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    # This is only a last-resort value. setup_project_log handles failure to
+    # open the actual file and keeps the application running without a log.
+    return candidates[0]
+
+
+
+# ============================================================
+#  Windows ANSI 颜色支持
+# ============================================================
+def _enable_ansi() -> None:
+    """启用 Windows 10+ 控制台 ANSI 转义序列"""
+    if sys.platform == "win32":
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except Exception:
+            pass
+
+PATTERN = re.compile(
+        r"[\u3400-\u4dbf"  # 汉字 扩展A
+        r"\u4e00-\u9fff"  # 汉字 基本区
+        r"\uf900-\ufaff"  # 汉字 兼容区
+        r"\u3000-\u303f"  # 中文标点 / CJK 符号
+        r"\uff00-\uffef"  # 全角数字/字母/符号
+        r"\u3040-\u309f"  # 平假名
+        r"\u30a0-\u30ff"  # 片假名
+        r"\uff66-\uff9d"  # 半角片假名
+        r"\uac00-\ud7a3"  # 韩文音节
+        r"\u3130-\u318f"  # 韩文兼容字母
+        r"\u1100-\u11ff]"  # 韩文 Jamo
+    )
+def count_cjk(text: str) -> int:
+    """统计：汉字 + 中文标点 + 全角数字/字母 + 日文假名 + 韩文 的个数"""
+    
+    return len(PATTERN.findall(text))
+
+
+_enable_ansi()
+
+
+# ============================================================
+#  ANSI 颜色码
+# ============================================================
+class C:
+    """ANSI 颜色 / 样式"""
+
+    RST = "\033[0m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GRN = "\033[32m"
+    YLW = "\033[33m"
+    BLU = "\033[34m"
+    CYN = "\033[36m"
+    B_RED = "\033[91m"
+    B_YLW = "\033[93m"
+
+
+# 级别 → 控制台颜色
+LEVEL_COLOR: dict[str, str] = {
+    "DEBUG": C.CYN,
+    "INFO": C.GRN,
+    "WARNING": C.B_YLW,
+    "ERROR": C.RED,
+    "CRITICAL": C.B_RED,
+}
+
+
+# ============================================================
+#  格式化器
+# ============================================================
+class ConsoleFormatter(logging.Formatter):
+    """控制台格式: [LEVEL] message │ HH:MM:SS filename:lineno"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = LEVEL_COLOR.get(record.levelname, C.RST)
+        ts = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+        lv = f"{record.levelname:<5}"
+        loc = f"{record.filename}:{record.lineno}"
+
+        # [LEVEL] message │ HH:MM:SS  file:line
+        left = f"{color}[{lv}]{C.RST} {record.getMessage()}"
+        right = f"{C.DIM}{ts}  {loc}{C.RST}"
+
+        # 补齐到 60 字符宽，保证右侧对齐
+        # 计算左侧可视宽度（去掉 ANSI 码）
+        left_vis = len(f"[{record.levelname:<5}] {record.getMessage()}") + count_cjk(
+            record.getMessage()
+        )
+        pad = max(2, 59 - left_vis)
+        msg = f"{left}{' ' * pad}│ {right}"
+
+        if record.exc_info and record.exc_info[0]:
+            msg += "\n" + self.formatException(record.exc_info)
+        return msg
+
+
+# 文件格式：完整时间 + 代码位置
+_FILE_FMT = logging.Formatter(
+    "%(asctime)s | %(levelname)-5s | %(filename)s:%(lineno)d | %(message)s"
+)
+
+
+# ============================================================
+#  Log 封装
+# ============================================================
+class Log:
+    """简洁日志：控制台彩色输出
+
+    用法:
+        log = Log("app")                 # INFO 级别
+        log = Log("app", mode="d")       # DEBUG 级别
+        log.logger.info("任务完成")
+        log.logger.error("出错")
+
+    文件日志由 setup_project_log() 统一管理，所有 Log 实例通过
+    propagate 自动汇集到 root logger 的单一 FileHandler。
+    """
+
+    def __init__(self, log_name: str, mode: str = "d") -> None:
+        # --- 级别 ---
+        console_level = logging.DEBUG if mode == "d" else logging.INFO
+
+        self.logger = logging.getLogger(log_name)
+        self.logger.setLevel(logging.DEBUG)  # 始终生成全级别日志，传播到 root→文件
+        self.logger.propagate = True  # 向上传播到 root（统一文件输出）
+
+        # 防止重复添加 handler（多次实例化同一 logger 名时）
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+
+        # --- 仅控制台 Handler（彩色），不创建独立文件 ---
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(console_level)  # 控制台按 mode 过滤显示级别
+        ch.setFormatter(ConsoleFormatter())
+        self.logger.addHandler(ch)
+
+
+# ============================================================
+#  项目级统一日志文件
+# ============================================================
+_PROJECT_FH: logging.FileHandler | None = None
+
+
+def _flush_project_log() -> None:
+    """atexit 回调：确保日志文件落盘"""
+    global _PROJECT_FH
+    if _PROJECT_FH is not None:
+        _PROJECT_FH.flush()
+
+
+def setup_project_log(log_dir: str | None = None, log_name: str | None = None) -> str:
+    """初始化当前进程的项目日志文件。
+
+    GUI 和自动化进程会同时运行。它们必须使用不同的日志文件，且不能
+    删除整个 ``logs`` 目录，否则 Windows 会因另一个进程仍占用日志文件
+    而在模块导入阶段抛出 PermissionError，导致自动化无提示退出。
+
+    :param log_dir:  日志目录路径，默认使用 %LOCALAPPDATA% 下的目录
+    :param log_name: 日志文件名（不含扩展名）；省略时根据启动角色选择
+    :return:         日志文件完整路径
+    """
+    global _PROJECT_FH
+
+    root = logging.getLogger()
+
+    # --- 清除旧 FileHandler ---
+    for h in list(root.handlers):
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            root.removeHandler(h)
+
+    if log_name is None:
+        log_name = "gbfr-gui" if "--gui" in sys.argv else "gbfr-automation"
+
+    # Prefer LocalAppData, then TEMP. The EXE directory is retained only as a
+    # final compatibility fallback for unusual locked-down Windows profiles.
+    fh: logging.FileHandler | None = None
+    log_path = ""
+    last_error: OSError | None = None
+    for candidate in _runtime_log_dir_candidates(log_dir):
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            candidate_path = os.path.join(candidate, f"{log_name}.log")
+            # ``utf-8-sig`` makes the log immediately readable in Windows
+            # Notepad while remaining normal UTF-8 for Python tools.
+            fh = logging.FileHandler(candidate_path, mode="w", encoding="utf-8-sig")
+            log_path = candidate_path
+            break
+        except OSError as exc:
+            last_error = exc
+
+    if fh is None:
+        # Logging must never make the GUI or automation process fail to start.
+        # Console logging remains available through each Log instance.
+        print(f"[WARNING] Cannot create log file: {last_error}", file=sys.stderr)
+        return ""
+
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(_FILE_FMT)
+    root.addHandler(fh)
+
+    _PROJECT_FH = fh
+    atexit.register(_flush_project_log)
+
+    # 用 root logger 写第一行日志标记启动
+    root.setLevel(logging.DEBUG)
+    root.debug("日志文件: %s", log_path)
+
+    return log_path

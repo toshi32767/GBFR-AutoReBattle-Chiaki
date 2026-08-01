@@ -1,0 +1,47 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Local runtime data. It can contain PSN redirect URLs, account IDs, or logs.
+logs/
+screenshot/
+automation-console.log
+*.log
+
+# Local Chiaki installs and registration data must never be committed.
+Chiaki/
+chiaki-build/
+chiaki-src/
+*.exe
+*.dll
+*.pdb
+
+# Build products and temporary diagnostics
+build/
+dist/
+build-pyinstaller/*
+dist-pyinstaller/
+release/
+release-v*/
+portable-v*/
+installer-stage*/
+installer/
+nuitka-crash-report.xml
+build_log.txt
+*.spec.bak
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# One-off local diagnostics
+custom_test.py
+_tmp_check.py
+output.png
+full.png

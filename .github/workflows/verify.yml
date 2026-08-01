@@ -1,0 +1,28 @@
+name: Verify source tree
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Check publish tree
+        shell: pwsh
+        run: .\scripts\verify_publish_tree.ps1
+
+      - name: Compile Python source
+        shell: pwsh
+        run: |
+          python -m py_compile main.py module\controller.py module\log.py module\psn_account.py module\utils.py
