@@ -38,3 +38,8 @@ redistribution. See `PUBLISH_BLOCKERS.md` before publishing source or binaries.
   one-second updates, and removed a duplicate statistics write per cycle.
 - Clarified runtime-limit semantics: the run timer starts when the automation
   process starts, while each battle's duration remains a separate statistic.
+- Fixed all Windows launcher scripts to locate the current root EXE and provide
+  a readable error when the package was not fully extracted.
+- Added independent optional ViGEmBus and HidHide install buttons and package
+  launchers. HidHide is never required by the background check and is never
+  configured automatically.

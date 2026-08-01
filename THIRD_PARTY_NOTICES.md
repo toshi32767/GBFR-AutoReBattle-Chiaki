@@ -11,6 +11,7 @@ provenance; it is not a replacement for a complete license audit.
 | RapidOCR / rapidocr-onnxruntime-lite | OCR implementation and models | https://github.com/RapidAI/RapidOCR, https://github.com/PaddlePaddle/PaddleOCR, and https://github.com/R4Ajeti/rapidocr-onnxruntime-lite | RapidOCR and PaddleOCR report Apache-2.0. The lite repository reported no license on 2026-08-01; do not publicly redistribute the vendored copy until permission/provenance and model notices are resolved. |
 | PyInstaller | Windows packaging | https://pyinstaller.org/ | GPL-2.0-or-later with a bootloader exception; use according to its terms. |
 | ViGEmBus / vgamepad | Virtual DS4 input | https://github.com/yannbouteiller/vgamepad | Install separately and retain its applicable notices. |
+| HidHide | Optional physical/virtual HID conflict isolation | https://github.com/nefarius/HidHide | MIT. Official signed v1.4.202 installer bundled optionally; retain upstream notices. |
 
 The names Granblue Fantasy, PlayStation, PSN, Sony, Cygames, and Chiaki belong
 to their respective owners. This project is an independent fan utility and is

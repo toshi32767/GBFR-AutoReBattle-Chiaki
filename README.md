@@ -35,11 +35,17 @@ public forum post or public GitHub Release until every blocker is resolved.
 ## One-stop user package
 
 For ordinary users, make one release package containing this built application,
-a separately obtained Chiaki release, and an optional signed ViGEmBus installer.
+a separately obtained Chiaki release, and optional signed installers for
+ViGEmBus and HidHide. Each component has its own install button and its own
+`.cmd` launcher; selecting one never starts the other.
 The app's **检查后台环境** button verifies the two things required by background
-mode: Windows Graphics Capture and a working virtual DS4. Its **安装虚拟手柄
-驱动** button runs `Dependencies/ViGEmBus_Setup.exe` with a normal Windows UAC
-confirmation when that installer is included.
+mode: Windows Graphics Capture and a working virtual DS4. Its **安装 ViGEmBus**
+button runs the bundled official installer with a normal Windows UAC
+confirmation when that installer is included. The **安装 HidHide** button is
+optional and only helps isolate a physical HID controller when it conflicts
+with the virtual DS4. It is not required for background mode, and the app never
+changes HidHide's device hiding list or allowlist automatically. Configure
+those choices yourself in HidHide Configuration Client after installation.
 
 Driver installation cannot be silent: ViGEmBus is a signed, kernel-level
 Windows driver and Windows must ask the user to approve it. Do not bundle a
@@ -58,7 +64,8 @@ GBFR_AutoReBattle-Chiaki/
     chiaki.exe
     ...official Chiaki release files...
   Dependencies/                 # optional, only if redistribution is allowed
-    ViGEmBus_Setup.exe
+    ViGEmBus_1.22.0_x64_x86_arm64.exe
+    HidHide_1.4.202_x64.exe
   NOTICE.md
   THIRD_PARTY_NOTICES.md
 ```

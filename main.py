@@ -671,6 +671,10 @@ def relink_battle(relink: Controller) -> None:
 
     def enter_battle() -> None:
         nonlocal battle_active, phase
+        with AUTOMATION_INPUT_LOCK:
+            # A previous result/stop transition must never leak a held axis
+            # into the next battle entry.
+            relink.release_automation_inputs()
         battle_active = True
         phase = "battle_active"
         _stats_start_battle()
@@ -690,23 +694,18 @@ def relink_battle(relink: Controller) -> None:
                 sleep(0.1)
                 continue
             try:
+                # Use short press/release pulses instead of a two-second held
+                # axis. A missed phase frame can then never leave W/Up latched
+                # while the result screen or town is already visible.
                 with AUTOMATION_INPUT_LOCK:
                     if relink.paused or not battle_active or not relink.running:
                         continue
-                    relink.press(LEFT_STICK_UP_KEY, movement="press")
-                    try:
-                        forward_deadline = time() + 2.0
-                        while (
-                            battle_active
-                            and not relink.paused
-                            and relink.running
-                            and time() < forward_deadline
-                        ):
-                            sleep(0.1)
-                    finally:
-                        relink.press(LEFT_STICK_UP_KEY, movement="release")
+                    relink.press(LEFT_STICK_UP_KEY)
+                sleep(0.15)
             except Exception:
                 log.debug("战斗推进按键异常（已释放前进）", exc_info=True)
+                with AUTOMATION_INPUT_LOCK:
+                    relink.release_automation_inputs()
 
     battle_thread = threading.Thread(target=battle_loop, daemon=True)
     battle_thread.start()
@@ -728,6 +727,8 @@ def relink_battle(relink: Controller) -> None:
             # Allow starting/restarting the tool while a result screen is open.
             if "RES" in read_region_text(relink, "RES"):
                 phase = "result"
+                with AUTOMATION_INPUT_LOCK:
+                    relink.release_automation_inputs()
                 log.info("识别到 BATTLE RESULTS，恢复到结算阶段")
                 continue
             sleep(1.0)
@@ -739,6 +740,8 @@ def relink_battle(relink: Controller) -> None:
             if "RES" in read_region_text(relink, "RES"):
                 battle_active = False
                 phase = "result"
+                with AUTOMATION_INPUT_LOCK:
+                    relink.release_automation_inputs()
                 duration = _stats_finish_battle()
                 log.info("阶段切换: battle_active -> result")
                 log.info(
@@ -805,6 +808,8 @@ def relink_battle(relink: Controller) -> None:
         sleep(1.0)
 
     battle_active = False
+    with AUTOMATION_INPUT_LOCK:
+        relink.release_automation_inputs()
 
 
 def relink_battle_silent(relink: Controller):
@@ -1279,13 +1284,15 @@ def run_unified_gui(args) -> int:
                 )
             return True
         details = "\n".join(f"- {item}" for item in missing)
-        set_status("后台环境缺少组件，请先点击“安装虚拟手柄驱动”或重新安装完整包")
+        set_status("后台环境缺少必要组件，请安装 ViGEmBus 后重新检查")
         if show_dialog:
             messagebox.showwarning(
                 "后台环境未完成",
                 "缺少以下组件：\n"
                 f"{details}\n\n"
-                "安装驱动后请回到这里点击“检查后台环境”。\n\n"
+                "后台模式只需要 Windows Capture 和 ViGEmBus；\n"
+                "HidHide 是可选的冲突隔离工具，不影响本项检查。\n"
+                "安装 ViGEmBus 后请回到这里点击“检查后台环境”。\n\n"
                 + input_details,
             )
         return False
@@ -1304,14 +1311,40 @@ def run_unified_gui(args) -> int:
             if result <= 32:
                 messagebox.showerror("安装未启动", "Windows 未能启动虚拟手柄驱动安装器。")
             else:
-                set_status("已启动虚拟手柄驱动安装器；完成后请点击“检查后台环境”")
+                set_status("已启动 ViGEmBus 安装器；完成后请点击“检查后台环境”")
             return
 
         webbrowser.open("https://github.com/nefarius/ViGEmBus/releases/latest")
         messagebox.showinfo(
-            "需要安装虚拟手柄驱动",
+            "需要安装 ViGEmBus",
             "完整包未附带驱动安装器，已打开 ViGEmBus 官方发布页。\n"
             "下载并完成安装后，回到工具点击“检查后台环境”。",
+        )
+
+    def install_hidhide() -> None:
+        """Launch the optional bundled HidHide installer with UAC.
+
+        HidHide is deliberately independent from the background-mode check.
+        The application never changes HidHide's device hiding list or allowlist.
+        """
+        installer = app_root() / "Dependencies" / "HidHide_1.4.202_x64.exe"
+        if installer.is_file():
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", str(installer), None, str(installer.parent), 1
+            )
+            if result <= 32:
+                messagebox.showerror("安装未启动", "Windows 未能启动 HidHide 安装器。")
+            else:
+                set_status(
+                    "已启动 HidHide 安装器；安装后请按需打开 HidHide Configuration Client 配置实体手柄"
+                )
+            return
+
+        webbrowser.open("https://github.com/nefarius/HidHide/releases/latest")
+        messagebox.showinfo(
+            "需要安装 HidHide",
+            "完整包未附带 HidHide 安装器，已打开官方发布页。\n"
+            "HidHide 只在实体手柄与虚拟 DS4 冲突时需要；安装后请手动配置隐藏设备。",
         )
 
     def append_console_log(text: str) -> None:
@@ -1617,7 +1650,8 @@ def run_unified_gui(args) -> int:
     )
     background_check.grid(row=2, column=0, columnspan=3, padx=12, pady=6, sticky="w")
     tk.Button(root, text="检查后台环境", command=check_background_environment, width=16).grid(row=3, column=0, padx=12, pady=(2, 6))
-    tk.Button(root, text="安装虚拟手柄驱动", command=install_virtual_gamepad_driver, width=18).grid(row=3, column=1, padx=8, pady=(2, 6), sticky="w")
+    tk.Button(root, text="安装 ViGEmBus", command=install_virtual_gamepad_driver, width=16).grid(row=3, column=1, padx=8, pady=(2, 6), sticky="w")
+    tk.Button(root, text="安装 HidHide", command=install_hidhide, width=16).grid(row=3, column=2, padx=12, pady=(2, 6), sticky="w")
     tk.Button(root, text="启动自动重战", command=start_automation, width=16).grid(row=4, column=0, padx=12, pady=8)
     tk.Button(root, text="暂停/继续（F3）", command=toggle_pause, width=16).grid(row=4, column=1, padx=8, pady=8, sticky="w")
     tk.Button(root, text="停止自动重战", command=stop_automation, width=16).grid(row=4, column=2, padx=12, pady=8)

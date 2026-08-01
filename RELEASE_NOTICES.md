@@ -33,6 +33,13 @@ ViGEmBus driver. The local portable package includes the official ViGEmBus
 v1.22.0 setup program and `ViGEmBus-LICENSE.txt`. Windows must show a UAC
 confirmation for driver installation; do not attempt to install it silently.
 
+HidHide 1.4.202 is an optional installer from Nefarius Software Solutions e.U.
+It is provided as a separate installer button and `安装HidHide.cmd`; it is not
+required for every installation. Use it only when physical HID devices conflict
+with the virtual DS4 path. The tool does not configure HidHide's device hiding
+list or allowlist automatically. The bundled installer is Authenticode-signed;
+its SHA256 is recorded in the package checksum file.
+
 ## GBFR_AutoReBattle base
 
 The base project is https://github.com/xinbaji/GBFR_AutoReBattle . At the time
