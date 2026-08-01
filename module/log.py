@@ -8,6 +8,33 @@ import tempfile
 from datetime import datetime
 
 
+def configure_standard_streams() -> None:
+    """Force one encoding for console logs on every Windows launch path.
+
+    Frozen executables do not consistently honor ``PYTHONIOENCODING``.  When
+    their stdout is redirected by the unified launcher, Windows can otherwise
+    encode part of the child output with the active ANSI code page and mix it
+    into the UTF-8 log opened by the parent process.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(
+                encoding="utf-8",
+                errors="replace",
+                write_through=True,
+            )
+        except (OSError, ValueError):
+            # GUI-only builds can expose a closed or detached standard stream.
+            # File logging still works in that environment.
+            pass
+
+
+configure_standard_streams()
+
+
 # ============================================================
 #  应用根目录（兼容 PyInstaller 单文件打包）
 # ============================================================

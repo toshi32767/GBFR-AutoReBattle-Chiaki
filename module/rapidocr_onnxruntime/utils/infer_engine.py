@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 from onnxruntime import (
+    ExecutionMode,
     GraphOptimizationLevel,
     InferenceSession,
     SessionOptions,
@@ -52,7 +53,13 @@ class OrtInferSession:
         sess_opt = SessionOptions()
         sess_opt.log_severity_level = 4
         sess_opt.enable_cpu_mem_arena = False
+        sess_opt.execution_mode = ExecutionMode.ORT_SEQUENTIAL
         sess_opt.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+        # These models are queried briefly every one or two seconds. Letting
+        # ONNX worker threads spin between calls wastes a visible share of an
+        # older 4-core CPU without improving recognition latency.
+        sess_opt.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        sess_opt.add_session_config_entry("session.inter_op.allow_spinning", "0")
 
         cpu_nums = os.cpu_count()
         intra_op_num_threads = config.get("intra_op_num_threads", -1)

@@ -1,4 +1,5 @@
 import ctypes
+import os
 import threading
 from ctypes import wintypes
 from time import monotonic, sleep, time
@@ -98,6 +99,8 @@ class Controller:
         self.invert_movement = bool(invert_movement)
 
         self._running: bool = False
+        self._paused: bool = False
+        self._shutdown_requested: bool = False
         self._hotkeys: dict[int, callable] = {}
         self._hwnd_warned: bool = False
         self._capture_lock = threading.Lock()
@@ -105,10 +108,18 @@ class Controller:
         self._capture_ready = threading.Event()
         self._capture_control = None
         self._capture = None
+        self._capture_hwnd: int | None = None
+        self._capture_generation = 0
+        self._capture_rebind_lock = threading.Lock()
         self._capture_warned = False
         self._capture_last_copy = 0.0
         self._virtual_gamepad = None
+        self._left_stick_x = 0.0
+        self._left_stick_y = 0.0
+        self._right_stick_x = 0.0
+        self._right_stick_y = 0.0
         self._movement_runtime_logged = False
+        self._camera_runtime_logged = False
 
         is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
         _log.info("=" * 40)
@@ -133,16 +144,24 @@ class Controller:
                 sleep(1)
 
             self._hotkey_thread: threading.Thread | None = None
-            # RapidOCR creates three ONNX sessions.  The runtime default lets
-            # every session span most logical CPUs (114 threads on a 5950X),
-            # which causes large scheduling spikes beside Chiaki.  Two compute
-            # threads per model preserve small-region OCR latency while keeping
-            # the workload balanced across modern multi-core CPUs.
+            logical_cpus = os.cpu_count() or 1
+            ocr_threads = 1 if logical_cpus <= 8 else 2
+            # Fixed-position markers use recognition-only OCR. Detection and
+            # orientation models stay unloaded unless a legacy full-OCR call
+            # actually requests them.
             self.ocrmodel = RapidOCR(
-                intra_op_num_threads=2,
+                use_det=False,
+                use_cls=False,
+                use_rec=True,
+                intra_op_num_threads=ocr_threads,
                 inter_op_num_threads=1,
             )
-            _log.info("OCR 配置 | 每模型计算线程=2 | 调度线程=1")
+            _log.info(
+                "OCR 配置 | 仅预加载文字识别模型 | 逻辑处理器=%d | "
+                "计算线程=%d | 调度线程=1 | 空闲自旋=关闭",
+                logical_cpus,
+                ocr_threads,
+            )
             self._ocr_lock = threading.Lock()
             self._stop_event = threading.Event()
             self._rect_thread: threading.Thread | None = None
@@ -162,7 +181,7 @@ class Controller:
             else:
                 _log.info(
                     "输入配置 | 模式=前台键盘 | W=Chiaki Left Stick Up | "
-                    "Return=Cross | \\=Square | L=L2 | 3=R1 | T=Touchpad"
+                    "Return=Cross | \\=Square | L=L2 | 3=R1"
                 )
             _log.debug("区域配置: %s 个", len(region_dict) if region_dict else 0)
 
@@ -190,20 +209,25 @@ class Controller:
         """Log the concrete input path and DS4 axis values for troubleshooting."""
         if self._virtual_gamepad is None:
             _log.info(
-                "输入配置 | 模式=后台窗口消息回退 | W=Chiaki Left Stick Up | "
-                "Return=Cross | \\=Square | L=L2 | 3=R1 | T=Touchpad"
+                "输入配置 | 模式=后台窗口消息回退 | "
+                "W/S/A/D=Chiaki Left Stick Up/Down/Left/Right | "
+                "Q/E=Chiaki Right Stick Left/Right | "
+                "Return=Cross | \\=Square | L=L2 | 3=R1"
             )
             return
 
         report = self._virtual_gamepad.report
         center = int(report.bThumbLY) & 0xFF
-        pressed = (255 if self.invert_movement else 1)
+        up_pressed = 255 if self.invert_movement else 1
+        down_pressed = 1 if self.invert_movement else 255
         _log.info(
-            "输入配置 | 模式=ViGEm DS4 | W=左摇杆上 | "
-            "bThumbLY: 中立=%d, W按下=%d, 释放=%d | 反向=%s | "
-            "Return=Cross, \\=Square, L=L2, 3=R1, T=Touchpad",
+            "输入配置 | 模式=ViGEm DS4 | W/S/A/D=左摇杆上/下/左/右 | "
+            "Q/E=右摇杆左/右 | "
+            "bThumbLY: 中立=%d, W按下=%d, S按下=%d, 释放=%d | 反向=%s | "
+            "Return=Cross, \\=Square, L=L2, 3=R1",
             center,
-            pressed,
+            up_pressed,
+            down_pressed,
             center,
             "是" if self.invert_movement else "否",
         )
@@ -218,22 +242,53 @@ class Controller:
             )
             sys.exit(0)
 
-    def _start_background_capture(self) -> None:
-        """Capture the Chiaki HWND without depending on foreground desktop pixels."""
+    def _start_background_capture(self, hwnd: int | None = None) -> None:
+        """Capture the current Chiaki HWND and rebind after window recreation."""
         if WindowsCapture is None:
             raise RuntimeError(
                 "后台模式缺少 windows-capture 依赖，请重新安装完整版本或执行 "
                 "py -3.10 -m pip install windows-capture"
             )
 
+        if hwnd is None:
+            hwnd = self._target_hwnd
+        if hwnd is None:
+            raise RuntimeError("无法启动后台捕获：尚未找到 Chiaki 串流窗口")
+
+        with self._capture_rebind_lock:
+            if self._capture_hwnd == hwnd and self._capture_control is not None:
+                return
+
+            previous_control = self._capture_control
+            self._capture_generation += 1
+            generation = self._capture_generation
+            self._capture = None
+            self._capture_control = None
+            self._capture_hwnd = None
+            with self._capture_lock:
+                self._latest_capture = None
+                self._capture_last_copy = 0.0
+            self._capture_ready.clear()
+
+        # Windows Capture can invoke on_closed synchronously from stop().
+        # Never hold the rebind lock while stopping the previous session or
+        # that callback could wait on the same lock and freeze automation.
+        if previous_control is not None:
+            try:
+                previous_control.stop()
+            except Exception:
+                _log.debug("停止旧 Chiaki 窗口捕获失败", exc_info=True)
+
         def on_frame_arrived(frame, _control) -> None:
             try:
+                if generation != self._capture_generation:
+                    return
                 # OCR runs at most once per second in normal battle phases.
-                # Keeping four frames per second is responsive enough while
-                # avoiding repeated 1080p/4K buffer copies that can contend
+                # Two frames per second still exceeds every normal OCR polling
+                # rate while halving repeated 1080p/4K buffer copies that can contend
                 # with Chiaki's decoder and renderer.
                 now = monotonic()
-                if now - self._capture_last_copy < 0.25:
+                if now - self._capture_last_copy < 0.5:
                     return
                 # The callback buffer may be reused after the callback returns.
                 pixels = np.array(frame.frame_buffer, copy=True)
@@ -245,12 +300,21 @@ class Controller:
                 _log.debug("后台窗口帧复制失败", exc_info=True)
 
         def on_closed() -> None:
-            _log.warning("后台窗口捕获已关闭，OCR 将无法继续更新")
+            if generation == self._capture_generation:
+                _log.warning("后台窗口捕获已关闭，等待 Chiaki 窗口恢复或重建")
+                with self._capture_rebind_lock:
+                    if generation == self._capture_generation:
+                        self._capture = None
+                        self._capture_control = None
+                        self._capture_hwnd = None
+                with self._capture_lock:
+                    self._latest_capture = None
+                self._capture_ready.clear()
 
         capture = WindowsCapture(
             cursor_capture=False,
-            window_hwnd=self._target_hwnd,
-            minimum_update_interval=250,
+            window_hwnd=hwnd,
+            minimum_update_interval=500,
         )
         capture.event(on_frame_arrived)
         capture.event(on_closed)
@@ -261,8 +325,17 @@ class Controller:
                 "无法启动 Chiaki 后台窗口捕获；请确认 Chiaki 使用窗口/无边框模式"
             ) from exc
 
-        self._capture = capture
-        self._capture_control = control
+        with self._capture_rebind_lock:
+            if generation != self._capture_generation:
+                try:
+                    control.stop()
+                except Exception:
+                    pass
+                return
+            self._capture = capture
+            self._capture_control = control
+            self._capture_hwnd = hwnd
+        _log.info("后台窗口捕获已绑定 hwnd=%s", hwnd)
         if not self._capture_ready.wait(timeout=5):
             _log.warning("后台窗口捕获尚未收到首帧，Chiaki 可能被最小化或暂停渲染")
 
@@ -270,10 +343,14 @@ class Controller:
     def screenshot_text(self, text):
         if self.window_rect is None:
             try:
-                left, top, width, height = self.get_window_rect(silent=True)
+                rect = self.get_window_rect(silent=True)
             except TypeError:
-                self.focus_window()
-                left, top, width, height = self.get_window_rect(silent=True)
+                if not self.background_mode:
+                    self.focus_window()
+                rect = self.get_window_rect(silent=True)
+            if rect is None:
+                raise RuntimeError("Chiaki 串流窗口暂时不可用")
+            left, top, width, height = rect
         else:
             left, top, width, height = self.window_rect
         if self.text2region is None or text not in self.text2region.keys():
@@ -390,9 +467,14 @@ class Controller:
             try:
                 self._virtual_gamepad.reset()
                 self._virtual_gamepad.update()
+                self._left_stick_x = 0.0
+                self._left_stick_y = 0.0
+                self._right_stick_x = 0.0
+                self._right_stick_y = 0.0
             except Exception:
                 _log.debug("复位虚拟手柄失败", exc_info=True)
         if self._capture_control is not None:
+            self._capture_generation += 1
             try:
                 self._capture_control.stop()
             except Exception:
@@ -435,18 +517,36 @@ class Controller:
         """
         hwnd = self._target_hwnd
         if hwnd is not None and win32gui.IsWindow(hwnd):
+            if self.background_mode and self._capture_hwnd != hwnd:
+                try:
+                    self._start_background_capture(hwnd)
+                except Exception:
+                    _log.warning("恢复 Chiaki 后台窗口捕获失败，将继续重试", exc_info=True)
             return hwnd
+        previous_hwnd = hwnd
+        self._target_hwnd = None
+        self.window_rect = None
         hwnd = self._find_window(self.target_window)
         if hwnd is not None:
             self._target_hwnd = hwnd
             self._hwnd_warned = False
+            if previous_hwnd is not None and previous_hwnd != hwnd:
+                _log.info(
+                    "检测到 Chiaki 串流窗口已重建: hwnd %s -> %s",
+                    previous_hwnd,
+                    hwnd,
+                )
+            if self.background_mode and self._capture_hwnd != hwnd:
+                try:
+                    self._start_background_capture(hwnd)
+                except Exception:
+                    _log.warning("重新绑定新 Chiaki 窗口捕获失败", exc_info=True)
             return hwnd
         else:
             if not self._hwnd_warned:
                 _log.warning("没有找到窗口: %s ", self.target_window)
                 self._hwnd_warned = True
-            if self.running == True:
-                self.running = False
+            return None
 
     def _find_window(self, title: str) -> int | None:
         """按标题（不区分大小写模糊匹配）查找可见窗口句柄"""
@@ -474,6 +574,49 @@ class Controller:
     def running(self, value: bool) -> None:
         self._running = value
 
+    @property
+    def paused(self) -> bool:
+        """Whether automation is temporarily paused without ending the run."""
+        return self._paused
+
+    @property
+    def shutdown_requested(self) -> bool:
+        """Whether an automatic limit requested a clean process shutdown."""
+        return self._shutdown_requested
+
+    def release_automation_inputs(self) -> None:
+        """Neutralize every controller axis/button the automation may hold."""
+        pad = self._virtual_gamepad
+        if pad is not None:
+            try:
+                pad.reset()
+                pad.update()
+                self._left_stick_x = 0.0
+                self._left_stick_y = 0.0
+                self._right_stick_x = 0.0
+                self._right_stick_y = 0.0
+                return
+            except Exception:
+                _log.warning("虚拟手柄归零失败", exc_info=True)
+
+        hwnd = self._get_hwnd()
+        for key in ("w", "s", "a", "d", "q", "e", "l"):
+            vk = self.KEY_MAP[key]
+            try:
+                if self.background_mode and hwnd is not None:
+                    self._post_key(hwnd, vk, keyup=True)
+                elif not self.background_mode:
+                    self._send_key(vk, keyup=True)
+            except Exception:
+                _log.debug("释放自动化按键 %s 失败", key, exc_info=True)
+
+    def request_shutdown(self) -> None:
+        """Stop automation and allow ``start`` to return to the process entry."""
+        self._shutdown_requested = True
+        self._paused = False
+        self._running = False
+        self.release_automation_inputs()
+
     def set_battle_start_key(self, key: str) -> None:
         """设置战斗开始快捷键（自动注册热键）
 
@@ -481,6 +624,7 @@ class Controller:
         """
 
         def _on_start() -> None:
+            self._paused = False
             self._running = True
             _log.info(">> %s 已启动", self.project_name)
             self.show_toast(self.project_name, "已启动")
@@ -496,11 +640,32 @@ class Controller:
 
         def _on_stop() -> None:
             self._running = False
+            self._paused = False
+            self.release_automation_inputs()
             _log.info("<< %s 已停止 按启动键重新开始", self.project_name)
             self.show_toast(self.project_name, "已停止，按启动键重新开始")
 
         _log.info("按 %s 停止", key)
         self._register_hotkey(key, _on_stop)
+
+    def set_battle_pause_key(self, key: str) -> None:
+        """Register a pause/resume hotkey which preserves the battle phase."""
+
+        def _on_toggle_pause() -> None:
+            if not self._running:
+                _log.info("%s 暂停键已忽略：自动重战尚未启动", key.upper())
+                return
+            self._paused = not self._paused
+            if self._paused:
+                self.release_automation_inputs()
+                _log.info("|| %s 已暂停；所有自动化按键已释放", self.project_name)
+                self.show_toast(self.project_name, "已暂停，按 F3 继续")
+            else:
+                _log.info(">> %s 已继续", self.project_name)
+                self.show_toast(self.project_name, "已继续")
+
+        _log.info("按 %s 暂停/继续", key)
+        self._register_hotkey(key, _on_toggle_pause)
 
     # ============================================================
     #  Win11 风格 Toast 通知（tkinter 圆角阴影 + 滑入滑出动画）
@@ -722,11 +887,10 @@ class Controller:
             sleep(0.05)
 
     def ocr(self, pic: Image, confidence=0.6):
-        # RapidOCR is shared by the battle loop and the V5 skip-prompt
-        # watchdog. Serialize inference so concurrent frame checks cannot
-        # corrupt or stall the ONNX session.
+        # RapidOCR can be called by multiple phase checks. Serialize inference
+        # so concurrent frame checks cannot corrupt or stall the ONNX session.
         with self._ocr_lock:
-            result = self.ocrmodel(pic, use_cls=False)
+            result = self.ocrmodel(pic, use_det=True, use_cls=False)
 
         if result is None or result[0] is None or len(result[0]) == 0:
             _log.debug("OCR: 未识别到文本")
@@ -1098,12 +1262,28 @@ class Controller:
                 pad.release_button(button_map[normalized])
         elif normalized == "l":
             pad.left_trigger_float(1.0 if pressed else 0.0)
-        elif normalized == "w":
-            # DS4 uses an unsigned Y axis: 0 is up and 255 is down. The
-            # vgamepad float helper maps -1.0 to 0, so W must use -1.0 to
-            # match Chiaki's foreground "Left Stick Up" keyboard mapping.
-            y_value = 1.0 if self.invert_movement else -1.0
-            pad.left_joystick_float(0.0, y_value if pressed else 0.0)
+        elif normalized in {"w", "s", "a", "d"}:
+            # Preserve the other axis so combinations such as S+A form a
+            # diagonal search arc instead of one key overwriting the other.
+            if normalized in {"w", "s"}:
+                y_value = -1.0 if normalized == "w" else 1.0
+                if self.invert_movement:
+                    y_value = -y_value
+                self._left_stick_y = y_value if pressed else 0.0
+            else:
+                x_value = -1.0 if normalized == "a" else 1.0
+                self._left_stick_x = x_value if pressed else 0.0
+            pad.left_joystick_float(
+                self._left_stick_x,
+                self._left_stick_y,
+            )
+        elif normalized in {"q", "e"}:
+            x_value = -1.0 if normalized == "q" else 1.0
+            self._right_stick_x = x_value if pressed else 0.0
+            pad.right_joystick_float(
+                self._right_stick_x,
+                self._right_stick_y,
+            )
         elif normalized == "up":
             pad.directional_pad(
                 vg.DS4_DPAD_DIRECTIONS.DS4_BUTTON_DPAD_NORTH
@@ -1120,14 +1300,24 @@ class Controller:
             return False
 
         pad.update()
-        if normalized == "w" and pressed and not self._movement_runtime_logged:
+        if normalized in {"w", "s", "a", "d"} and pressed and not self._movement_runtime_logged:
             report = pad.report
             _log.info(
-                "运行时 DS4 实测 | W 按下后 bThumbLX=%d, bThumbLY=%d",
+                "运行时 DS4 实测 | %s 按下后 bThumbLX=%d, bThumbLY=%d",
+                normalized.upper(),
                 int(report.bThumbLX) & 0xFF,
                 int(report.bThumbLY) & 0xFF,
             )
             self._movement_runtime_logged = True
+        if normalized in {"q", "e"} and pressed and not self._camera_runtime_logged:
+            report = pad.report
+            _log.info(
+                "运行时 DS4 实测 | %s 按下后 bThumbRX=%d, bThumbRY=%d",
+                normalized.upper(),
+                int(report.bThumbRX) & 0xFF,
+                int(report.bThumbRY) & 0xFF,
+            )
+            self._camera_runtime_logged = True
         return True
 
     def press(
@@ -1144,6 +1334,11 @@ class Controller:
         :param interval: 每次按键之间的间隔（秒）
         :param movement: "press"仅按下 / "release"仅弹起 / "press_and_release"按下后弹起
         """
+        # A release must always be allowed so pausing or a phase transition can
+        # neutralize a key that was pressed just before the state changed.
+        if self._paused and movement != "release":
+            return
+
         vk = self.KEY_MAP.get(key.lower())
         if vk is None:
             raise ValueError(f"未知的按键名: '{key}'，请检查 KEY_MAP")
@@ -1171,9 +1366,9 @@ class Controller:
             sleep(interval)
 
     def start(self, func):
-        while True:
-            if not self.running:
-            # 等待 F1 启动
+        while not self.shutdown_requested:
+            if not self.running or self.paused:
+                # 等待 F1 启动，或等待 F3 继续。
                 sleep(0.1)
             else:
                 func(self)

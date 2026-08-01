@@ -1,10 +1,12 @@
 # GBFR AutoReBattle - Chiaki Adapter
 
+Current release candidate: **v0.1.0 (Windows build V26, 2026-08-01)**.
+
 Windows helper for using the GBFR AutoReBattle workflow through a Chiaki PS5
 Remote Play stream. The control panel brings together:
 
 - Chiaki launch and stream-window configuration;
-- GBFR OCR automation, battle lock-on, and verified intro skip;
+- GBFR OCR automation, battle lock-on, and verified result continuation;
 - virtual DualShock 4 input for background operation;
 - a PSN AccountID helper that copies only the resulting ID locally;
 - an embedded, live runtime log with UTF-8/GB18030 compatibility.
@@ -22,8 +24,13 @@ copyright holder grants permission or publishes a license. Do not add an MIT
 license merely because an upstream README badge says MIT.
 
 Chiaki is AGPL-3.0-or-later. This source repository intentionally does not
-include Chiaki binaries or source. See [NOTICE.md](NOTICE.md) and
+include Chiaki binaries or source. A portable package containing Chiaki must
+publish the exact corresponding source at the same download location; see
+[CORRESPONDING_SOURCE.md](CORRESPONDING_SOURCE.md), [NOTICE.md](NOTICE.md), and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The current package is a private release candidate. Do not attach it to a
+public forum post or public GitHub Release until every blocker is resolved.
 
 ## One-stop user package
 
@@ -64,8 +71,9 @@ the stream can stop presenting frames.
 
 1. Start `启动工具.cmd` and accept the administrator prompt.
 2. Click **启动 Chiaki**, register the console, and connect to the PS5.
-3. In Chiaki key mappings, configure: Left Stick Up = `W`, Cross = `Return`,
-   R1 = `3`, Touchpad = `T`, L2 = `L`, and Moon/skip = `Backspace`.
+3. In Chiaki key mappings, configure: Left Stick Up/Down/Left/Right =
+   `W`/`S`/`A`/`D`, Right Stick Left/Right = `Q`/`E`, Cross = `Return`,
+   R1 = `3`, and L2 = `L`. No Touchpad mapping is required by the automation.
 4. For background mode, check **后台运行**, click **检查后台环境**, and install
    the virtual gamepad driver if requested.
 5. Press **启动自动重战**. Use `F2` to stop automation immediately.

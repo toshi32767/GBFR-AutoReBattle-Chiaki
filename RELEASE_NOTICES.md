@@ -1,15 +1,25 @@
 # Binary release notices
 
+Release candidate: **v0.1.0 (Windows build V26, 2026-08-01)**.
+
+This candidate is for private testing and archival only while the blockers in
+`PUBLISH_BLOCKERS.md` remain unresolved. These notices do not create permission
+to distribute code that has no license.
+
 This file is for a binary package that contains both this automation program
 and a separately obtained Chiaki Windows release.
 
 ## Chiaki
 
 Chiaki is Free and Open Source Software under the GNU Affero General Public
-License v3.0 or later. Keep the `Chiaki\LICENSE.txt` distributed with its
-official Windows package. Corresponding source and the original project are
-available at https://git.sr.ht/~thestr4ng3r/chiaki . Do not represent this
-package as an official Chiaki release.
+License v3.0 or later. The bundled build is Chiaki 2.2.0 at revision
+`89368f63c99d67cde8868c0269b66a1b0c507397`. The ordinary tag ZIP omits Git
+submodule contents and is not complete corresponding source by itself. Before
+distribution, provide a complete tag-and-submodule source archive at the same
+download location, retain `Chiaki\LICENSE.txt`, and follow
+`CORRESPONDING_SOURCE.md`. The original project is at
+https://git.sr.ht/~thestr4ng3r/chiaki . Do not represent this package as an
+official Chiaki release.
 
 ## Windows capture and virtual controller driver
 
@@ -19,9 +29,9 @@ the full OpenCV package is not required because this project only uses the
 library's optional image-save compatibility path.
 
 Background input uses a virtual DualShock 4 provided by vgamepad and the
-ViGEmBus driver. This installer includes the official ViGEmBus v1.22.0 setup
-program and `ViGEmBus-LICENSE.txt`. Windows must show a UAC confirmation for
-driver installation; do not attempt to install it silently.
+ViGEmBus driver. The local portable package includes the official ViGEmBus
+v1.22.0 setup program and `ViGEmBus-LICENSE.txt`. Windows must show a UAC
+confirmation for driver installation; do not attempt to install it silently.
 
 ## GBFR_AutoReBattle base
 

@@ -9,11 +9,14 @@ window and sends controller-mapped keyboard events to Chiaki.
 In Chiaki Settings, set these key mappings before starting the adapter:
 
 - `Left Stick Up`: `W`
+- `Left Stick Down`: `S`
+- `Left Stick Left`: `A`
+- `Left Stick Right`: `D`
+- `Right Stick Left`: `Q`
+- `Right Stick Right`: `E`
 - `Cross`: `Return`
 - `R1`: `3`
-- `Touchpad`: `T`
 - `L2`: `L`
-- `Moon/skip`: `Backspace` (the keyboard key sent to open the skip prompt)
 
 The other mappings can stay at their defaults. Recommended stream settings are
 1080p, 60 FPS, H265, and `d3d11va` hardware decoding for an AMD GPU.
@@ -24,28 +27,32 @@ game configurations toggle lock-on each time the button is pressed. If L2 is
 mapped to another keyboard key, pass it with `--l2-key`, for example
 `--l2-key "2"`.
 
-During battle, the adapter samples the four skill diamonds once per second. If
-the upper skill or the right-side skill remains bright continuously for 10
-seconds, it treats that as a lost target and presses L2 once more. A short
-brightness drop caused by battle effects is tolerated for up to 5 seconds; the
-timer resets only after the trigger skills stay dark for that grace period.
-The detector uses normalized 16:9 coordinates and ignores the brightness of the
-other two skills.
+During battle, the adapter monitors the upper and right-side skill diamonds. If
+either remains bright for 15 seconds, it treats that as a possible lost target.
+It releases forward movement, briefly holds Left Stick Down plus an alternating
+left/right movement and camera sweep. This forms a search arc that can bring an
+off-screen target back into view. It sends L2 once while the turn/search arc is
+still in progress, then releases both sticks and waits 1.5 seconds before
+checking two consecutive frames. The checks verify the result of that in-turn
+lock; they never send a second L2, because a second press can toggle a
+successful lock off. The next normal battle action resumes forward movement.
+A short brightness drop caused by battle effects is tolerated
+for up to 5 seconds; the timer resets only after the trigger skills stay dark
+for that grace period.
+The recovery is disabled outside the confirmed battle phase, so it cannot carry
+movement or L2 into the result screen.
+The upstream middle-mouse action is Relink's lock-on command, whose controller
+equivalent is L2. It must not be mapped to the DS4 Touchpad: that mapping can
+open Relink's command wheel, dim the complete HUD, and prevent reliable skill
+monitoring. If Chiaki is closed and a new stream window with the same title is
+opened, background capture automatically rebinds to its new window handle while
+the selected background mode remains unchanged.
 
-## Intro skip confirmation (V5)
+## Intro skipping
 
-When the intro screen shows the `跳过` prompt, V4 presses Backspace to open
-the `是否跳过？` menu, then presses Up. It reads the selection bar from the
-captured frame and sends Return only when the `是` row is visibly highlighted.
-If the stream stutters or the selection cannot be verified, it does not
-confirm the menu; this prevents accidentally choosing `否` or closing the
-dialog. After sending Return, V5 keeps the input lock and checks that the
-`是否跳过？` menu has actually disappeared. If it remains visible, Return is
-retried up to four more times before giving up safely.
-
-The `跳过` prompt is monitored by a separate OCR watchdog while the battle has
-not started, so it is not sampled only between the normal `跳跃` checks. This
-reduces missed prompts when the intro animation or stream frame changes quickly.
+The adapter does not OCR or operate the battle-intro `跳过` prompt and never
+sends Backspace. Enable Relink's own automatic intro-skip option instead. This
+keeps unrelated combat and result inputs from interfering with a skip dialog.
 
 ## Important window requirements
 
@@ -54,7 +61,7 @@ reduces missed prompts when the intro animation or stream frame changes quickly.
   uses a desktop capture because QOpenGLWidget frames are not reliably returned
   by Windows `PrintWindow`.
 - Use the game's Simplified Chinese UI because the OCR regions look for Chinese
-  labels such as `跳过`, `是否跳过`, `跳跃`, `再次`, `挑战`, and `结算`.
+  labels such as `跳跃`, `再次`, `继续`, `挑战`, and `结算`.
 - Keep the stream window at the same aspect ratio as the PS5 output. The OCR
   regions are normalized and work with ordinary 16:9 window sizes.
 
@@ -67,7 +74,9 @@ py -3.10 -m pip install -r requirements.txt
 py -3.10 .\main.py
 ```
 
-Press `F1` to start the loop and `F2` to stop it. The `--silent` option is kept
+Press `F1` to start the loop, `F2` to stop it, and `F3` to pause/resume without
+resetting the current battle phase. The pause releases all automated buttons
+and virtual-stick axes immediately. The `--silent` option is kept
 for compatibility with the upstream project, but the Chiaki window must still
 remain visible for screen capture:
 
@@ -132,8 +141,15 @@ The re-focus duration can be changed for testing. Values below 5 seconds are
 clamped to 5 seconds:
 
 ```powershell
-.\GBFR_AutoReBattle\GBFR_AutoReBattle.exe --refocus-seconds 10
+.\GBFR_AutoReBattle\GBFR_AutoReBattle.exe --refocus-seconds 15
 ```
+
+The unified panel shows each completed battle duration and can stop after a
+number of battles, a number of running minutes, or a daily `HH:MM` time. The
+same limits are available through `--max-battles`, `--max-runtime-minutes`,
+and `--stop-at`; when a limit is reached, the tool releases input and asks the
+Chiaki process to close. Session data is written to
+`%LOCALAPPDATA%\GBFR-AutoReBattle\logs\session-stats.json`.
 
 Do not move the EXE out of its folder; the `_internal` directory contains its
 DLLs and OCR runtime files.

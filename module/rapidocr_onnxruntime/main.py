@@ -53,13 +53,16 @@ class RapidOCR:
         self.width_height_ratio = global_config["width_height_ratio"]
 
         self.use_det = global_config["use_det"]
-        self.text_det = TextDetector(config["Det"])
+        self._det_config = config["Det"]
+        self.text_det = TextDetector(self._det_config) if self.use_det else None
 
         self.use_cls = global_config["use_cls"]
-        self.text_cls = TextClassifier(config["Cls"])
+        self._cls_config = config["Cls"]
+        self.text_cls = TextClassifier(self._cls_config) if self.use_cls else None
 
         self.use_rec = global_config["use_rec"]
-        self.text_rec = TextRecognizer(config["Rec"])
+        self._rec_config = config["Rec"]
+        self.text_rec = TextRecognizer(self._rec_config) if self.use_rec else None
 
         self.load_img = LoadImage()
         self.max_side_len = global_config["max_side_len"]
@@ -78,6 +81,12 @@ class RapidOCR:
         use_det = self.use_det if use_det is None else use_det
         use_cls = self.use_cls if use_cls is None else use_cls
         use_rec = self.use_rec if use_rec is None else use_rec
+        if use_det and self.text_det is None:
+            self.text_det = TextDetector(self._det_config)
+        if use_cls and self.text_cls is None:
+            self.text_cls = TextClassifier(self._cls_config)
+        if use_rec and self.text_rec is None:
+            self.text_rec = TextRecognizer(self._rec_config)
         return_word_box = False
         if kwargs:
             box_thresh = kwargs.get("box_thresh", 0.5)
