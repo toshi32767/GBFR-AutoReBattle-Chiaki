@@ -43,3 +43,6 @@ redistribution. See `PUBLISH_BLOCKERS.md` before publishing source or binaries.
 - Added independent optional ViGEmBus and HidHide install buttons and package
   launchers. HidHide is never required by the background check and is never
   configured automatically.
+- Fixed pause/resume race conditions: F3 resume now releases all inputs,
+  briefly blocks forward movement, and rechecks `RES`/`继续` before the battle
+  movement worker is allowed to resume.

@@ -100,6 +100,9 @@ class Controller:
 
         self._running: bool = False
         self._paused: bool = False
+        # Monotonic toggle counter.  Consumers can detect a pause/resume edge
+        # even when both hotkey events happen between two polling iterations.
+        self._pause_generation: int = 0
         self._shutdown_requested: bool = False
         self._hotkeys: dict[int, callable] = {}
         self._hwnd_warned: bool = False
@@ -580,6 +583,11 @@ class Controller:
         return self._paused
 
     @property
+    def pause_generation(self) -> int:
+        """Return the number of pause/resume toggles since controller start."""
+        return self._pause_generation
+
+    @property
     def shutdown_requested(self) -> bool:
         """Whether an automatic limit requested a clean process shutdown."""
         return self._shutdown_requested
@@ -656,6 +664,7 @@ class Controller:
                 _log.info("%s 暂停键已忽略：自动重战尚未启动", key.upper())
                 return
             self._paused = not self._paused
+            self._pause_generation += 1
             if self._paused:
                 self.release_automation_inputs()
                 _log.info("|| %s 已暂停；所有自动化按键已释放", self.project_name)

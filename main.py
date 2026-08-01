@@ -668,6 +668,12 @@ def relink_battle(relink: Controller) -> None:
     battle_active = False
     phase = "battle_wait"
     battle_number = 1
+    # Resume is a synchronization boundary: the OCR/state loop must get one
+    # chance to classify a result screen before the movement worker can send
+    # another forward pulse.  A dict keeps this shared value writable from the
+    # worker thread without introducing another lock around every poll.
+    resume_guard = {"until": 0.0}
+    main_pause_generation = relink.pause_generation
 
     def enter_battle() -> None:
         nonlocal battle_active, phase
@@ -682,6 +688,27 @@ def relink_battle(relink: Controller) -> None:
         with AUTOMATION_INPUT_LOCK:
             relink.press(L2_KEY)
 
+    def transition_to_result() -> None:
+        """Move to result handling exactly once and finish the battle stats."""
+        nonlocal battle_active, phase, battle_number
+        if phase == "battle_active":
+            battle_active = False
+            phase = "result"
+            with AUTOMATION_INPUT_LOCK:
+                relink.release_automation_inputs()
+            duration = _stats_finish_battle()
+            log.info("阶段切换: battle_active -> result")
+            log.info(
+                "--- 第 %d 场战斗结算%s ---",
+                battle_number,
+                f"，本场耗时 {_format_duration(duration)}" if duration is not None else "",
+            )
+            battle_number += 1
+        elif phase != "result":
+            phase = "result"
+            with AUTOMATION_INPUT_LOCK:
+                relink.release_automation_inputs()
+
     def battle_loop() -> None:
         """后台线程：战斗中分段保持向前接近敌人。
 
@@ -689,8 +716,26 @@ def relink_battle(relink: Controller) -> None:
         Its controller equivalent is L2, not the DS4 Touchpad. Target locking
         is handled by L2 at battle entry and by the focus watchdog instead.
         """
+        worker_pause_generation = relink.pause_generation
         while True:
-            if relink.paused or not battle_active or not relink.running:
+            current_generation = relink.pause_generation
+            if current_generation != worker_pause_generation:
+                worker_pause_generation = current_generation
+                if not relink.paused:
+                    # Handle a rapid pause/resume before the OCR loop gets a
+                    # scheduling turn.  The main loop will still perform the
+                    # result/continue probe; this only blocks movement here.
+                    resume_guard["until"] = max(
+                        resume_guard["until"], time() + 1.25
+                    )
+                    with AUTOMATION_INPUT_LOCK:
+                        relink.release_automation_inputs()
+            if (
+                relink.paused
+                or time() < resume_guard["until"]
+                or not battle_active
+                or not relink.running
+            ):
                 sleep(0.1)
                 continue
             try:
@@ -720,6 +765,29 @@ def relink_battle(relink: Controller) -> None:
         if relink.paused:
             sleep(0.2)
             continue
+
+        current_generation = relink.pause_generation
+        if current_generation != main_pause_generation:
+            # Do not let a stale pre-pause phase resume directly into movement.
+            # This also covers a result screen that appeared while the user
+            # paused: ``继续`` is checked before the next W pulse is allowed.
+            main_pause_generation = current_generation
+            resume_guard["until"] = time() + 1.25
+            with AUTOMATION_INPUT_LOCK:
+                relink.release_automation_inputs()
+            log.info("暂停已解除：先重新检查结算标记，再恢复战斗推进")
+            if phase == "battle_active":
+                if "RES" in read_region_text(relink, "RES"):
+                    transition_to_result()
+                    continue
+                if "继续" in read_region_text(relink, "继续"):
+                    transition_to_result()
+                    continue
+            # For the normal result phase, fall through immediately so the
+            # verified two-frame ``继续`` check can run without waiting a tick.
+            if phase == "result":
+                if press_verified_result_continue(relink):
+                    continue
         if phase == "battle_wait":
             if "跳跃" in read_region_text(relink, "跳跃"):
                 enter_battle()
@@ -738,18 +806,7 @@ def relink_battle(relink: Controller) -> None:
             # V6's stable battle-end marker.  One OCR per second is sufficient
             # for a screen that remains visible until user input.
             if "RES" in read_region_text(relink, "RES"):
-                battle_active = False
-                phase = "result"
-                with AUTOMATION_INPUT_LOCK:
-                    relink.release_automation_inputs()
-                duration = _stats_finish_battle()
-                log.info("阶段切换: battle_active -> result")
-                log.info(
-                    "--- 第 %d 场战斗结算%s ---",
-                    battle_number,
-                    f"，本场耗时 {_format_duration(duration)}" if duration is not None else "",
-                )
-                battle_number += 1
+                transition_to_result()
                 continue
             sleep(1.0)
             continue
