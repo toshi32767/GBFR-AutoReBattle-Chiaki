@@ -1,11 +1,9 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-rem Known-good Chiaki keyboard mapping:
-rem W/S/A/D=Left Stick, Q/E=Right Stick Left/Right,
-rem Return=Cross, \=Square, L=L2, 3=R1. Touchpad is not used.
+rem The GUI synchronizes the current Chiaki keyboard mapping automatically.
 rem Keep foreground mode as the baseline; enable background mode from the GUI
-rem only after checking the virtual DS4 report.
+rem after the environment check if other windows must cover Chiaki.
 if exist "%~dp0GBFR_AutoReBattle.exe" goto current
 if exist "%~dp0GBFR.exe" goto legacy
 if exist "%~dp0GBFR_AutoReBattle\GBFR_AutoReBattle.exe" goto nested

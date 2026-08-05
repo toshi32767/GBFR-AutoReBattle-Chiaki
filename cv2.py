@@ -14,6 +14,11 @@ import numpy as np
 from PIL import Image
 
 
+def __collect_extra_submodules(*_args: object, **_kwargs: object) -> list[str]:
+    """Satisfy Nuitka's optional OpenCV module discovery hook."""
+    return []
+
+
 def imwrite(filename: str | Path, image: np.ndarray) -> bool:
     """Write a BGR/BGRA/RGB image and match OpenCV's boolean result contract."""
     try:

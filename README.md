@@ -1,6 +1,6 @@
 # GBFR AutoReBattle - Chiaki Adapter
 
-Current release candidate: **v0.1.0 (Windows build V26, 2026-08-01)**.
+Current private review build: **v0.1.0 (Windows build V41, 2026-08-03)**.
 
 Windows helper for using the GBFR AutoReBattle workflow through a Chiaki PS5
 Remote Play stream. The control panel brings together:
@@ -35,22 +35,18 @@ public forum post or public GitHub Release until every blocker is resolved.
 ## One-stop user package
 
 For ordinary users, make one release package containing this built application,
-a separately obtained Chiaki release, and optional signed installers for
-ViGEmBus and HidHide. Each component has its own install button and its own
-`.cmd` launcher; selecting one never starts the other.
-The app's **检查后台环境** button verifies the two things required by background
-mode: Windows Graphics Capture and a working virtual DS4. Its **安装 ViGEmBus**
-button runs the bundled official installer with a normal Windows UAC
-confirmation when that installer is included. The **安装 HidHide** button is
-optional and only helps isolate a physical HID controller when it conflicts
-with the virtual DS4. It is not required for background mode, and the app never
-changes HidHide's device hiding list or allowlist automatically. Configure
-those choices yourself in HidHide Configuration Client after installation.
+a separately obtained Chiaki release, and optional signed component installers.
+Each component has its own install button and its own `.cmd` launcher; selecting
+one never starts the other. The app's **检查后台环境** button reports whether the
+background input chain is ready. If it requests a driver, use the matching
+install button and approve the normal Windows UAC prompt. The optional HidHide
+button is only for isolating a physical HID controller when duplicate input is
+observed; the app never changes its device list automatically.
 
-Driver installation cannot be silent: ViGEmBus is a signed, kernel-level
-Windows driver and Windows must ask the user to approve it. Do not bundle a
-driver installer unless its own redistribution terms allow it. When no local
-installer is present, the tool opens the official ViGEmBus release page.
+Driver installation cannot be silent: signed kernel-level Windows drivers must
+be approved by Windows. Do not bundle a driver installer unless its own
+redistribution terms allow it. When no local installer is present, the tool
+opens the official release page.
 
 Suggested release layout:
 
@@ -78,11 +74,11 @@ the stream can stop presenting frames.
 
 1. Start `启动工具.cmd` and accept the administrator prompt.
 2. Click **启动 Chiaki**, register the console, and connect to the PS5.
-3. In Chiaki key mappings, configure: Left Stick Up/Down/Left/Right =
-   `W`/`S`/`A`/`D`, Right Stick Left/Right = `Q`/`E`, Cross = `Return`,
-   R1 = `3`, and L2 = `L`. No Touchpad mapping is required by the automation.
+3. Click **一键同步输入配置**. Foreground mode reads the existing Chiaki
+   keyboard mappings; there is no need to remap them by hand. Background mode
+   does not depend on Chiaki keyboard mappings.
 4. For background mode, check **后台运行**, click **检查后台环境**, and install
-   the virtual gamepad driver if requested.
+   the requested component if necessary.
 5. Press **启动自动重战**. Use `F2` to stop automation immediately.
 
 The AccountID helper opens Sony's sign-in page in the user's browser. Do not
@@ -100,6 +96,21 @@ python -m pip install -r requirements-dev.txt
 .\scripts\build_release.ps1 -Python "python"
 ```
 
+For a fresh checkout, the dependency setup and complete runtime check can be
+run in one step:
+
+```powershell
+.\scripts\setup_dev.ps1 -Python "py -3.10"
+py -3.10 .\main.py --diagnostics
+```
+
+`--diagnostics` reports missing OCR and controller packages individually. In
+particular, `Shapely` is required by the vendored RapidOCR detector; it is
+already listed in `requirements.txt`, but it is not present in an unrelated
+Python runtime until that environment installs the project requirements. The
+setup script runs this same diagnostic after installation, so it cannot report
+success while a required package is still missing.
+
 The output is `release\dist\GBFR_AutoReBattle`. Add Chiaki separately when
 assembling a user package. The included PyInstaller specification uses paths
 relative to the project root, so it can build from a cloned repository.
@@ -111,8 +122,8 @@ py -3.10 -m pip install -r requirements.txt
 py -3.10 .\main.py --gui
 ```
 
-Background input depends on the Nefarius ViGEmBus driver. `vgamepad` alone is
-not sufficient. HidHide is optional and not required by this application.
+Background input requires the supported virtual-controller driver to be installed;
+HidHide is optional and not required by this application.
 
 ## Security and release hygiene
 

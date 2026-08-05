@@ -6,19 +6,10 @@ window and sends controller-mapped keyboard events to Chiaki.
 
 ## Chiaki settings
 
-In Chiaki Settings, set these key mappings before starting the adapter:
-
-- `Left Stick Up`: `W`
-- `Left Stick Down`: `S`
-- `Left Stick Left`: `A`
-- `Left Stick Right`: `D`
-- `Right Stick Left`: `Q`
-- `Right Stick Right`: `E`
-- `Cross`: `Return`
-- `R1`: `3`
-- `L2`: `L`
-
-The other mappings can stay at their defaults. Recommended stream settings are
+The unified panel's **一键同步输入配置** reads the existing Chiaki mappings from
+the current Windows user profile. Foreground automation uses those mappings and
+does not overwrite them; background automation does not depend on them. The
+other mappings can stay at their defaults. Recommended stream settings are
 1080p, 60 FPS, H265, and `d3d11va` hardware decoding for an AMD GPU.
 
 After the battle-entry OCR marker is detected, the adapter presses L2 once to
@@ -60,8 +51,10 @@ keeps unrelated combat and result inputs from interfering with a skip dialog.
 - Keep the Chiaki stream visible and unobscured. Do not minimize it. This adapter
   uses a desktop capture because QOpenGLWidget frames are not reliably returned
   by Windows `PrintWindow`.
-- Use the game's Simplified Chinese UI because the OCR regions look for Chinese
-  labels such as `跳跃`, `再次`, `继续`, `挑战`, and `结算`.
+- The tool supports Simplified Chinese and Japanese UI. In automatic language
+  mode it locks onto the first reliable marker and then uses only that OCR
+  model. Battle entry also checks the right-half `剩余时间` / `残り時間` timer
+  together with the battle HUD, so the town screen is not treated as battle.
 - Keep the stream window at the same aspect ratio as the PS5 output. The OCR
   regions are normalized and work with ordinary 16:9 window sizes.
 
@@ -110,18 +103,17 @@ URL, and copies the resulting ID to the clipboard. The same flow is available
 without the panel via `--account-id`.
 
 The background mode uses Windows Graphics Capture for the Chiaki window and a
-virtual DualShock 4 created through `vgamepad` / ViGEmBus. This avoids relying
-on Qt window messages, which some Chiaki builds ignore while the stream is not
-focused. Other windows may cover Chiaki and the automation will not call
-`SetForegroundWindow`. Do not minimize Chiaki: minimized OpenGL/remote-play
-windows can stop presenting frames, in which case OCR cannot observe state
-changes.
+controller input backend. This avoids relying on Qt window messages, which some
+Chiaki builds ignore while the stream is not focused. Other windows may cover
+Chiaki and the automation will not call `SetForegroundWindow`. Do not minimize
+Chiaki: minimized OpenGL/remote-play windows can stop presenting frames, in
+which case OCR cannot observe state changes.
 
 Use the panel's `检查后台环境` button before enabling background mode. It verifies
-that Windows Graphics Capture and the ViGEm virtual-controller driver are both
-working. The driver installer requires a normal Windows UAC confirmation and
-must not be installed silently. The first run should be tested with F2 ready
-because controller behavior can differ between Chiaki builds.
+that capture and the configured controller input chain are working. Any driver
+installer requires a normal Windows UAC confirmation and must not be installed
+silently. The first run should be tested with F2 ready because controller
+behavior can differ between Chiaki builds.
 
 For convenience, `启动工具.cmd` opens the panel. `启动后台自动重战.cmd`
 starts both components directly with background mode, while

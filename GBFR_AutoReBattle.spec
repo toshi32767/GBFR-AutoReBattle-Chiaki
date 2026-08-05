@@ -10,7 +10,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('module\\rapidocr_onnxruntime\\config.yaml', 'module\\rapidocr_onnxruntime'), ('module\\rapidocr_onnxruntime\\models', 'module\\rapidocr_onnxruntime\\models')] + vgamepad_datas,
+    datas=[('module\\rapidocr_onnxruntime\\config.yaml', 'module\\rapidocr_onnxruntime'), ('module\\rapidocr_onnxruntime\\models', 'module\\rapidocr_onnxruntime\\models'), ('assets\\gbfr-crystal-icon.png', 'assets'), ('assets\\ability-qualified.wav', 'assets')] + vgamepad_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -31,6 +31,15 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# RapidOCR imports the project's lightweight ``cv2.py`` compatibility shim,
+# but the wheel's optional video-reader DLLs are not used by this application.
+# Keep the shim and all required native libraries while dropping only these
+# redundant OpenCV FFmpeg binaries from portable releases.
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if not entry[0].lower().startswith("cv2\\opencv_videoio_ffmpeg")
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -46,10 +55,11 @@ exe = EXE(
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
+    uac_admin=True,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['granblue_fantasy_relink.ico'],
+    icon=['assets\\gbfr-crystal-icon.ico'],
 )
 coll = COLLECT(
     exe,

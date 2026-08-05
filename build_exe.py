@@ -29,7 +29,8 @@ if sys.stderr.encoding != "utf-8":
 # ── 路径配置 ─────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENTRY_SCRIPT = PROJECT_ROOT / "main.py"
-ICON_FILE = PROJECT_ROOT / "granblue_fantasy_relink.ico"
+ICON_FILE = PROJECT_ROOT / "assets" / "gbfr-crystal-icon.ico"
+GUI_ICON_FILE = PROJECT_ROOT / "assets" / "gbfr-crystal-icon.png"
 APP_NAME = "GBFR_AutoReBattle"
 DIST_DIR = PROJECT_ROOT / "dist"
 
@@ -93,18 +94,26 @@ def build_command() -> list[str]:
         # ── 输出控制 ──
         "--standalone",
         "--onefile",
+        # Put the elevation request in the EXE manifest. This lets Windows
+        # handle UAC before Python starts and avoids a fragile second
+        # ``ShellExecuteW(runas)`` hop from a .cmd launcher.
+        "--windows-uac-admin",
         f"--windows-icon-from-ico={ICON_FILE}",
         f"--output-dir={DIST_DIR}",
         f"--output-filename={APP_NAME}.exe",
         # ── 优化 ──
         "--remove-output",
-        "--disable-cache=all",
+        # Keep Nuitka's user cache enabled. Disabling it forced every release
+        # to recompile the full OCR/capture dependency graph from scratch.
+        f"--jobs={max(2, min(8, (os.cpu_count() or 4) - 1))}",
         "--assume-yes-for-downloads",
         # ── 压缩由 Nuitka 4.x 自动处理，检测到 zstandard 时自动启用 ──
         # ── anti-bloat 在 Nuitka 4.x 中默认启用，无需手动指定 ──
         # ── 数据文件 ──
         f"--include-data-files={config_file}=module/rapidocr_onnxruntime/config.yaml",
         f"--include-data-dir={models_dir}=module/rapidocr_onnxruntime/models",
+        f"--include-data-files={GUI_ICON_FILE}=assets/gbfr-crystal-icon.png",
+        f"--include-data-files={PROJECT_ROOT / 'assets' / 'ability-qualified.wav'}=assets/ability-qualified.wav",
         # ── 隐藏导入 ──
         "--include-package=shapely",
         "--include-package=pyclipper",

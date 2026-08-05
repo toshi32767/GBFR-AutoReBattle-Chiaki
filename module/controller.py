@@ -1,7 +1,9 @@
 import ctypes
 import os
+import subprocess
 import threading
 from ctypes import wintypes
+from pathlib import Path
 from time import monotonic, sleep, time
 import tkinter as tk
 import sys
@@ -9,6 +11,7 @@ import win32api
 import win32con
 import win32gui
 import win32ui
+import win32process
 from PIL import Image, ImageGrab
 from module.log import Log, setup_project_log
 import numpy as np
@@ -75,6 +78,20 @@ setup_project_log()
 _log = Log("controller", "i").logger  # 新增：全局复用
 
 
+def stream_caption_matches_target(configured_title: str, observed_caption: str) -> bool:
+    """Match a visible window against the title configured by the user.
+
+    ``Chiaki | Stream`` is only the local default. Other clients may use any
+    custom title, so no language or ``Stream`` keyword is inferred here.
+    Substring matching preserves support for a runtime-added suffix such as a
+    resolution or session name.
+    """
+
+    configured = str(configured_title or "").strip().casefold()
+    observed = str(observed_caption or "").strip()
+    return bool(configured) and configured in observed.casefold()
+
+
 class Controller:
     def __init__(
         self,
@@ -83,6 +100,9 @@ class Controller:
         region_dict=None,
         background=False,
         invert_movement=False,
+        expected_process_id=None,
+        allow_missing_window=False,
+        ui_language="auto",
     ) -> None:
         self.run_as_admin()
 
@@ -96,6 +116,14 @@ class Controller:
         # opposite sign. Keep this explicit so a client machine can correct
         # direction without changing its Chiaki keyboard mapping.
         self.invert_movement = bool(invert_movement)
+        normalized_language = str(ui_language).strip().lower()
+        if normalized_language not in {"auto", "zh", "ja"}:
+            raise ValueError(f"unsupported UI language: {ui_language}")
+        self.ui_language_mode = normalized_language
+        self.detected_ui_language: str | None = (
+            None if normalized_language == "auto" else normalized_language
+        )
+        self._ui_language_lock = threading.Lock()
 
         self._running: bool = False
         self._paused: bool = False
@@ -103,7 +131,9 @@ class Controller:
         # even when both hotkey events happen between two polling iterations.
         self._pause_generation: int = 0
         self._shutdown_requested: bool = False
+        self._shutdown_reason: str | None = None
         self._hotkeys: dict[int, callable] = {}
+        self._hotkey_combos: dict[tuple[int, tuple[int, ...]], callable] = {}
         self._hwnd_warned: bool = False
         self._capture_lock = threading.Lock()
         self._latest_capture = None
@@ -115,6 +145,12 @@ class Controller:
         self._capture_rebind_lock = threading.Lock()
         self._capture_warned = False
         self._capture_last_copy = 0.0
+        self._capture_frame_serial = 0
+        self._window_was_iconic = False
+        self._expected_process_id: int | None = (
+            int(expected_process_id) if expected_process_id else None
+        )
+        self._window_detection_logged: set[int] = set()
         self._virtual_gamepad = None
         self._left_stick_x = 0.0
         self._left_stick_y = 0.0
@@ -122,6 +158,13 @@ class Controller:
         self._right_stick_y = 0.0
         self._movement_runtime_logged = False
         self._camera_runtime_logged = False
+        # Foreground SendInput is global. Track keys that this controller has
+        # actually pressed so a lost Chiaki window cannot cause a new global
+        # key press, while a later stop can still release an already-held key.
+        self._foreground_pressed_keys: set[str] = set()
+        self._automation_release_keys = {
+            "w", "s", "a", "d", "q", "e", "l", "c", "up", "3", "enter", "\\"
+        }
 
         is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
         _log.info("=" * 40)
@@ -143,6 +186,9 @@ class Controller:
                     self._target_hwnd = hwnd
                     _log.info("已找到窗口: '%s'", target)
                     break
+                if allow_missing_window:
+                    _log.info("尚无串流窗口，将由重连状态机启动并绑定")
+                    break
                 sleep(1)
 
             self._hotkey_thread: threading.Thread | None = None
@@ -151,7 +197,14 @@ class Controller:
             _log.info("正在加载 OCR 识别引擎，请稍候...")
             # ONNX Runtime is the heaviest child-process import. Loading it
             # here lets the live logger report progress before that work.
-            from module.rapidocr_onnxruntime import RapidOCR
+            try:
+                from module.rapidocr_onnxruntime import RapidOCR
+            except ModuleNotFoundError as exc:
+                missing = exc.name or "未知模块"
+                raise RuntimeError(
+                    f"OCR 运行依赖缺失：{missing}。请在项目 Python 环境执行 "
+                    "python -m pip install -r requirements.txt；可先运行 main.py --diagnostics 检查。"
+                ) from exc
 
             # Fixed-position markers use recognition-only OCR. Detection and
             # orientation models stay unloaded unless a legacy full-OCR call
@@ -163,19 +216,44 @@ class Controller:
                 intra_op_num_threads=ocr_threads,
                 inter_op_num_threads=1,
             )
+            self.ocrmodels = {"zh": self.ocrmodel}
+            if self.ui_language_mode in {"auto", "ja"}:
+                japanese_model_path = (
+                    Path(__file__).resolve().parent
+                    / "rapidocr_onnxruntime"
+                    / "models"
+                    / "japan_PP-OCRv4_rec_infer.onnx"
+                )
+                if not japanese_model_path.is_file():
+                    raise FileNotFoundError(
+                        f"日文 OCR 模型缺失: {japanese_model_path}"
+                    )
+                self.ocrmodels["ja"] = RapidOCR(
+                    use_det=False,
+                    use_cls=False,
+                    use_rec=True,
+                    rec_model_path=str(japanese_model_path),
+                    intra_op_num_threads=ocr_threads,
+                    inter_op_num_threads=1,
+                )
             _log.info(
                 "OCR 配置 | 仅预加载文字识别模型 | 逻辑处理器=%d | "
-                "计算线程=%d | 调度线程=1 | 空闲自旋=关闭",
+                "计算线程=%d | 调度线程=1 | 空闲自旋=关闭 | 界面语言=%s",
                 logical_cpus,
                 ocr_threads,
+                {"auto": "自动识别", "zh": "简体中文", "ja": "日文"}[
+                    self.ui_language_mode
+                ],
             )
             self._ocr_lock = threading.Lock()
             self._stop_event = threading.Event()
             self._rect_thread: threading.Thread | None = None
             self._start_rect_watchdog()
-            if self.background_mode:
+            if self.background_mode and self._target_hwnd is not None:
                 self._init_virtual_gamepad()
                 self._start_background_capture()
+            elif self.background_mode:
+                self._init_virtual_gamepad()
             self._init_toast()
             _log.info(
                 "初始化完成 | 目标窗口: '%s' | 捕获: %s | Toast: %s",
@@ -240,16 +318,44 @@ class Controller:
         )
 
     def run_as_admin(self) -> None:
-        if not ctypes.windll.shell32.IsUserAnAdmin():
-            ctypes.windll.shell32.ShellExecuteW(
-                None, "runas",
-                sys.argv[0],
-                " ".join(sys.argv[1:]),
-                None, 1,
-            )
-            sys.exit(0)
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return
 
-    def _start_background_capture(self, hwnd: int | None = None) -> None:
+        # Keep the legacy/controller entry point diagnosable too. The unified
+        # GUI normally handles elevation first, but direct CLI launches can
+        # still reach this method.
+        executable_path = Path(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]).resolve()
+        parameters = subprocess.list2cmdline(
+            sys.argv[1:] if getattr(sys, "frozen", False) else [str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
+        )
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            str(executable_path),
+            parameters,
+            str(executable_path.parent),
+            1,
+        )
+        if result <= 32:
+            try:
+                last_error = ctypes.get_last_error()
+            except (AttributeError, OSError):
+                last_error = 0
+            _log.error(
+                "管理员提权失败 | ShellExecuteW=%s | GetLastError=%s | exe=%s | 参数=%s",
+                result,
+                last_error,
+                executable_path,
+                parameters or "<无>",
+            )
+            raise RuntimeError(
+                f"无法以管理员身份启动控制器（ShellExecuteW={result}, GetLastError={last_error}）"
+            )
+        sys.exit(0)
+
+    def _start_background_capture(
+        self, hwnd: int | None = None, *, force: bool = False
+    ) -> None:
         """Capture the current Chiaki HWND and rebind after window recreation."""
         if WindowsCapture is None:
             raise RuntimeError(
@@ -263,7 +369,11 @@ class Controller:
             raise RuntimeError("无法启动后台捕获：尚未找到 Chiaki 串流窗口")
 
         with self._capture_rebind_lock:
-            if self._capture_hwnd == hwnd and self._capture_control is not None:
+            if (
+                not force
+                and self._capture_hwnd == hwnd
+                and self._capture_control is not None
+            ):
                 return
 
             previous_control = self._capture_control
@@ -287,6 +397,7 @@ class Controller:
                 _log.debug("停止旧 Chiaki 窗口捕获失败", exc_info=True)
 
         def on_frame_arrived(frame, _control) -> None:
+            nonlocal first_frame_logged
             try:
                 if generation != self._capture_generation:
                     return
@@ -299,9 +410,20 @@ class Controller:
                     return
                 # The callback buffer may be reused after the callback returns.
                 pixels = np.array(frame.frame_buffer, copy=True)
+                if not first_frame_logged:
+                    first_frame_logged = True
+                    sample = pixels[:, :, :3]
+                    _log.info(
+                        "后台捕获首帧 | hwnd=%s | shape=%s | mean=%.1f | std=%.1f",
+                        hwnd,
+                        tuple(pixels.shape),
+                        float(np.mean(sample)),
+                        float(np.std(sample)),
+                    )
                 with self._capture_lock:
                     self._latest_capture = pixels
                     self._capture_last_copy = now
+                    self._capture_frame_serial += 1
                 self._capture_ready.set()
             except Exception:
                 _log.debug("后台窗口帧复制失败", exc_info=True)
@@ -318,6 +440,7 @@ class Controller:
                     self._latest_capture = None
                 self._capture_ready.clear()
 
+        first_frame_logged = False
         capture = WindowsCapture(
             cursor_capture=False,
             window_hwnd=hwnd,
@@ -342,9 +465,35 @@ class Controller:
             self._capture = capture
             self._capture_control = control
             self._capture_hwnd = hwnd
-        _log.info("后台窗口捕获已绑定 hwnd=%s", hwnd)
+        process_id, executable = self.stream_window_process_info()
+        _log.info(
+            "后台窗口捕获已绑定 hwnd=%s | owner_pid=%s | owner_process=%s",
+            hwnd,
+            process_id,
+            executable or "未知",
+        )
         if not self._capture_ready.wait(timeout=5):
             _log.warning("后台窗口捕获尚未收到首帧，Chiaki 可能被最小化或暂停渲染")
+
+    def capture_frame_state(self) -> tuple[int, float]:
+        """Return the latest copied-frame serial and monotonic timestamp."""
+        with self._capture_lock:
+            return self._capture_frame_serial, self._capture_last_copy
+
+    def wait_for_fresh_capture(
+        self, previous_serial: int, timeout: float = 3.0
+    ) -> bool:
+        """Wait until Windows Graphics Capture supplies a newer stream frame."""
+        if not self.background_mode:
+            sleep(min(max(timeout, 0.0), 0.75))
+            return True
+        deadline = monotonic() + max(0.1, timeout)
+        while monotonic() < deadline and not self._stop_event.is_set():
+            serial, _ = self.capture_frame_state()
+            if serial > previous_serial:
+                return True
+            sleep(min(0.05, max(0.0, deadline - monotonic())))
+        return False
 
 
     def screenshot_text(self, text):
@@ -390,11 +539,10 @@ class Controller:
             if self.background_mode:
                 if not self._capture_warned:
                     _log.warning(
-                        "Chiaki 窗口已最小化；请恢复窗口（可以被其他窗口覆盖，但不要最小化）"
+                        "Chiaki 窗口已最小化；已暂停画面判断，恢复窗口后会自动重新绑定"
                     )
                     self._capture_warned = True
-                left, top, width, height = self.window_rect
-                return Image.new("RGB", (max(1, width), max(1, height)), "black")
+                raise RuntimeError("Chiaki stream window is temporarily minimized")
             _log.warning("Chiaki stream window is minimized; restore it before starting")
             self.focus_window()
 
@@ -436,9 +584,20 @@ class Controller:
                 _log.warning("未找到窗口: '%s'", self.target_window)
             return None
         if win32gui.IsIconic(hwnd):
+            self._window_was_iconic = True
             if not silent:
                 _log.debug("窗口最小化，沿用上次有效矩形: %s", self.window_rect)
             return self.window_rect
+
+        if self._window_was_iconic:
+            self._window_was_iconic = False
+            self._capture_warned = False
+            if self.background_mode:
+                _log.info("Chiaki 窗口已恢复，正在重新绑定后台画面捕获")
+                try:
+                    self._start_background_capture(hwnd, force=True)
+                except Exception:
+                    _log.warning("Chiaki 窗口恢复后的捕获重绑失败，将继续重试", exc_info=True)
 
         c_left, c_top, c_right, c_bottom = win32gui.GetClientRect(hwnd)
         left, top = win32gui.ClientToScreen(hwnd, (c_left, c_top))
@@ -470,6 +629,7 @@ class Controller:
     def stop(self) -> None:
         """停止监听线程（daemon 线程也会随主进程退出，这里用于显式优雅停止）"""
         self._stop_event.set()
+        self.release_automation_inputs()
         if self._virtual_gamepad is not None:
             try:
                 self._virtual_gamepad.reset()
@@ -524,12 +684,24 @@ class Controller:
         """
         hwnd = self._target_hwnd
         if hwnd is not None and win32gui.IsWindow(hwnd):
-            if self.background_mode and self._capture_hwnd != hwnd:
-                try:
-                    self._start_background_capture(hwnd)
-                except Exception:
-                    _log.warning("恢复 Chiaki 后台窗口捕获失败，将继续重试", exc_info=True)
-            return hwnd
+            caption = win32gui.GetWindowText(hwnd).strip()
+            if stream_caption_matches_target(self.target_window, caption):
+                if (
+                    self.background_mode
+                    and self._capture_hwnd != hwnd
+                    and not win32gui.IsIconic(hwnd)
+                ):
+                    try:
+                        self._start_background_capture(hwnd)
+                    except Exception:
+                        _log.warning("恢复 Chiaki 后台窗口捕获失败，将继续重试", exc_info=True)
+                return hwnd
+            _log.warning(
+                "缓存的 Chiaki 窗口标题已变化：hwnd=%s，标题='%s'，配置='%s'；重新搜索",
+                hwnd,
+                caption or "<无标题>",
+                self.target_window,
+            )
         previous_hwnd = hwnd
         self._target_hwnd = None
         self.window_rect = None
@@ -543,7 +715,11 @@ class Controller:
                     previous_hwnd,
                     hwnd,
                 )
-            if self.background_mode and self._capture_hwnd != hwnd:
+            if (
+                self.background_mode
+                and self._capture_hwnd != hwnd
+                and not win32gui.IsIconic(hwnd)
+            ):
                 try:
                     self._start_background_capture(hwnd)
                 except Exception:
@@ -555,19 +731,322 @@ class Controller:
                 self._hwnd_warned = True
             return None
 
+    def set_expected_process_id(self, process_id: int | None) -> None:
+        """Restrict window rebinding to a known Chiaki process after recovery."""
+        self._expected_process_id = int(process_id) if process_id else None
+        self._target_hwnd = None
+        self.window_rect = None
+
+    def target_process_id(self) -> int | None:
+        """Return the process owning the currently bound stream window."""
+        hwnd = self._target_hwnd
+        if hwnd is None or not win32gui.IsWindow(hwnd):
+            hwnd = self._get_hwnd()
+        if hwnd is None:
+            return None
+        try:
+            _, process_id = win32process.GetWindowThreadProcessId(hwnd)
+            return int(process_id)
+        except Exception:
+            return None
+
+    def stream_window_process_info(self) -> tuple[int | None, str]:
+        """Return the bound stream window PID and executable basename."""
+        hwnd = self._target_hwnd
+        if hwnd is None or not win32gui.IsWindow(hwnd):
+            return None, ""
+        try:
+            _, process_id = win32process.GetWindowThreadProcessId(hwnd)
+            process_id = int(process_id)
+        except Exception:
+            return None, ""
+        try:
+            handle = win32api.OpenProcess(
+                0x1000 | 0x0010,  # QUERY_LIMITED_INFORMATION | VM_READ
+                False,
+                process_id,
+            )
+            if not handle:
+                return process_id, ""
+            try:
+                path = win32process.GetModuleFileNameEx(handle, 0)
+            finally:
+                win32api.CloseHandle(handle)
+            return process_id, os.path.basename(path).lower()
+        except Exception:
+            return process_id, ""
+
+    def stream_binding_is_valid(self) -> bool:
+        """Confirm that the current capture target is still a Chiaki window."""
+        hwnd = self._target_hwnd
+        if hwnd is None or not win32gui.IsWindow(hwnd):
+            return False
+        caption = win32gui.GetWindowText(hwnd).strip()
+        if not stream_caption_matches_target(self.target_window, caption):
+            _log.warning(
+                "当前捕获窗口标题不符合配置：hwnd=%s，标题='%s'，配置='%s'；拒绝继续识别",
+                hwnd,
+                caption or "<无标题>",
+                self.target_window,
+            )
+            return False
+        process_id, executable = self.stream_window_process_info()
+        if process_id is None:
+            return False
+        if (
+            self._expected_process_id is not None
+            and process_id != self._expected_process_id
+        ):
+            _log.warning(
+                "串流窗口进程不匹配：绑定 PID=%s，预期 PID=%s",
+                process_id,
+                self._expected_process_id,
+            )
+            return False
+        if executable and not executable.startswith("chiaki"):
+            _log.warning(
+                "串流窗口不是 Chiaki 进程：PID=%s，进程=%s",
+                process_id,
+                executable,
+            )
+            return False
+        if self._expected_process_id is None and not executable:
+            _log.warning("无法确认串流窗口所属进程，拒绝继续使用当前捕获")
+            return False
+        return True
+
+    @staticmethod
+    def process_is_alive(process_id: int | None) -> bool:
+        """Check one process without enumerating or affecting other Chiaki PIDs."""
+        if not process_id:
+            return False
+        try:
+            handle = win32api.OpenProcess(
+                win32con.PROCESS_QUERY_LIMITED_INFORMATION,
+                False,
+                int(process_id),
+            )
+            if not handle:
+                return False
+            try:
+                return win32process.GetExitCodeProcess(handle) == win32con.STILL_ACTIVE
+            finally:
+                win32api.CloseHandle(handle)
+        except Exception:
+            return False
+
+    def expected_process_has_window(self, title_fragment: str) -> bool:
+        """Detect an error/dialog window owned by the current reconnect PID."""
+        process_id = self._expected_process_id
+        if not process_id:
+            return False
+        found = False
+
+        def callback(hwnd: int, _: object) -> bool:
+            nonlocal found
+            try:
+                _, owner_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if int(owner_pid) != process_id:
+                    return True
+                title = win32gui.GetWindowText(hwnd)
+                if title_fragment.lower() in title.lower():
+                    found = True
+                    return False
+            except Exception:
+                return True
+            return True
+
+        try:
+            win32gui.EnumWindows(callback, None)
+        except Exception:
+            pass
+        return found
+
+    def close_bound_stream_process(self, timeout: float = 8.0) -> int | None:
+        """Close only the process owning this automation's current stream."""
+        process_id = self.target_process_id() or self._expected_process_id
+        if process_id is None:
+            return None
+        hwnd = self._target_hwnd
+        if hwnd is not None and win32gui.IsWindow(hwnd):
+            try:
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            except Exception:
+                _log.debug("请求关闭 Chiaki 串流窗口失败", exc_info=True)
+        deadline = monotonic() + max(0.5, timeout)
+        while monotonic() < deadline:
+            try:
+                handle = win32api.OpenProcess(
+                    win32con.PROCESS_QUERY_INFORMATION,
+                    False,
+                    process_id,
+                )
+                if handle:
+                    win32api.CloseHandle(handle)
+                    sleep(0.2)
+                    continue
+            except Exception:
+                pass
+            break
+
+        # A stuck decoder can ignore WM_CLOSE. Terminate only the PID that owns
+        # the bound stream, never every process named chiaki.exe.
+        try:
+            handle = win32api.OpenProcess(
+                win32con.PROCESS_TERMINATE | win32con.PROCESS_QUERY_INFORMATION,
+                False,
+                process_id,
+            )
+            if handle:
+                win32api.TerminateProcess(handle, 1)
+                win32api.CloseHandle(handle)
+                _log.warning("Chiaki 串流进程无响应，已结束绑定 PID=%d", process_id)
+        except Exception:
+            _log.debug("结束 Chiaki 绑定进程失败", exc_info=True)
+
+        self._expected_process_id = None
+        self._target_hwnd = None
+        self.window_rect = None
+        self._capture_hwnd = None
+        with self._capture_lock:
+            self._latest_capture = None
+        return process_id
+
     def _find_window(self, title: str) -> int | None:
-        """按标题（不区分大小写模糊匹配）查找可见窗口句柄"""
-        result: list[int] = []
+        """Find only the visible window whose caption matches the configuration.
+
+        The Chiaki main window belongs to the same process and can be large
+        enough to look like a stream surface. Process name, title keywords,
+        and window size are therefore not allowed to replace the configured
+        title. When a recovery PID is known, only windows from that PID are
+        considered in addition to the title match.
+        """
+        if not str(title or "").strip():
+            _log.warning("未配置 Chiaki 窗口标题，拒绝自动绑定")
+            return None
+        exact: list[int] = []
+        candidates: list[tuple[int, int, int, str]] = []
+
+        def process_name(process_id: int) -> str:
+            try:
+                handle = win32api.OpenProcess(
+                    0x1000 | 0x0010,  # QUERY_LIMITED_INFORMATION | VM_READ
+                    False,
+                    process_id,
+                )
+                if not handle:
+                    return ""
+                try:
+                    return os.path.basename(
+                        win32process.GetModuleFileNameEx(handle, 0)
+                    ).lower()
+                finally:
+                    win32api.CloseHandle(handle)
+            except Exception:
+                return ""
 
         def callback(hwnd: int, _: object) -> bool:
             if win32gui.IsWindowVisible(hwnd):
                 text: str = win32gui.GetWindowText(hwnd)
-                if title.lower() in text.lower():
-                    result.append(hwnd)
+                if not text.strip():
+                    return True
+                try:
+                    _, process_id = win32process.GetWindowThreadProcessId(hwnd)
+                except Exception:
+                    return True
+                process_id = int(process_id)
+                if (
+                    self._expected_process_id is not None
+                    and process_id != self._expected_process_id
+                ):
+                    return True
+                lowered = text.lower()
+                # A stale title saved by the GUI may be the unified control
+                # panel itself. Never bind automation to that window; it is
+                # not the Chiaki stream surface.
+                if (
+                    "gbfr 自动重战" in text
+                    or "gbfr autorebattle" in lowered
+                    or "控制台" in text
+                ):
+                    return True
+                title_is_chiaki = "chiaki" in lowered
+                title_is_stream = "stream" in lowered or "串流" in text
+                process_is_chiaki = process_name(process_id).startswith("chiaki")
+                # Never bind based on caption text alone. A browser tab can
+                # contain "Stream"/"串流" and previously caused the control
+                # panel to attach to Edge instead of launching Chiaki. The
+                # recovery PID is trusted because this process launched it.
+                trusted_process = (
+                    process_is_chiaki
+                    or self._expected_process_id is not None
+                )
+                if title and title.lower() in lowered and trusted_process:
+                    exact.append(hwnd)
+                    return True
+
+                # The Chiaki launcher/main window is also a large window owned
+                # by chiaki.exe. Never fall back to process name and window
+                # size: the configured title is the only authoritative target.
+                if not stream_caption_matches_target(self.target_window, text):
+                    return True
+
+                excluded_title = any(
+                    marker in lowered
+                    for marker in (
+                        "settings",
+                        "configuration",
+                        "register",
+                        "registration",
+                        "设置",
+                        "注册",
+                    )
+                )
+                if excluded_title:
+                    return True
+                if not trusted_process:
+                    return True
+                score = 0
+                if title_is_stream:
+                    score += 60
+                if title_is_chiaki:
+                    score += 35
+                if process_is_chiaki:
+                    score += 45
+                if self._expected_process_id is not None:
+                    # A CLI-launched Chiaki stream process normally owns only
+                    # one visible window, even when its title is customized.
+                    score += 40
+                try:
+                    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                    area = max(0, right - left) * max(0, bottom - top)
+                except Exception:
+                    area = 0
+                if process_is_chiaki and area >= 400_000:
+                    # A custom build may remove both "Chiaki" and "Stream"
+                    # from its title. Prefer its large stream surface over a
+                    # small launcher/settings window in that case.
+                    score += 25
+                if score >= 60:
+                    candidates.append((score, area, hwnd, text))
             return True
 
         win32gui.EnumWindows(callback, None)
-        return result[0] if result else None
+        if exact:
+            return exact[0]
+        if not candidates:
+            return None
+        _, _, hwnd, detected_title = max(
+            candidates, key=lambda item: (item[0], item[1])
+        )
+        if hwnd not in self._window_detection_logged:
+            self._window_detection_logged.add(hwnd)
+            _log.info(
+                "已找到 Chiaki 串流窗口（标题与配置不同）：'%s' (hwnd=%s)",
+                detected_title,
+                hwnd,
+            )
+        return hwnd
 
     # ============================================================
     #  热键系统（内部实现，外部通过 set_battle_start/stop_key 使用）
@@ -593,8 +1072,20 @@ class Controller:
 
     @property
     def shutdown_requested(self) -> bool:
-        """Whether an automatic limit requested a clean process shutdown."""
+        """Whether the automation process should leave its main loop."""
         return self._shutdown_requested
+
+    @property
+    def shutdown_reason(self) -> str | None:
+        """Return why the automation process was asked to shut down."""
+        return self._shutdown_reason
+
+    def activate_automation(self, source: str = "启动命令") -> None:
+        """Enter a clean running state through one shared, observable path."""
+        self._paused = False
+        self._running = True
+        self.release_automation_inputs()
+        _log.info(">> %s 已启动（来源：%s）", self.project_name, source)
 
     def release_automation_inputs(self) -> None:
         """Neutralize every controller axis/button the automation may hold."""
@@ -607,24 +1098,44 @@ class Controller:
                 self._left_stick_y = 0.0
                 self._right_stick_x = 0.0
                 self._right_stick_y = 0.0
+                self._foreground_pressed_keys.clear()
                 return
             except Exception:
                 _log.warning("虚拟手柄归零失败", exc_info=True)
 
-        hwnd = self._get_hwnd()
-        for key in ("w", "s", "a", "d", "q", "e", "l"):
-            vk = self.KEY_MAP[key]
+        try:
+            hwnd = self._get_hwnd()
+        except Exception:
+            hwnd = None
+            _log.debug("释放输入时目标窗口查询失败", exc_info=True)
+        foreground_keys = set(self._foreground_pressed_keys)
+        for key in (
+            foreground_keys
+            if not self.background_mode
+            else self._automation_release_keys
+        ):
+            vk = self.KEY_MAP.get(key)
+            if vk is None:
+                continue
             try:
                 if self.background_mode and hwnd is not None:
                     self._post_key(hwnd, vk, keyup=True)
-                elif not self.background_mode:
+                elif not self.background_mode and key in foreground_keys:
                     self._send_key(vk, keyup=True)
             except Exception:
                 _log.debug("释放自动化按键 %s 失败", key, exc_info=True)
+        self._foreground_pressed_keys.clear()
 
-    def request_shutdown(self) -> None:
-        """Stop automation and allow ``start`` to return to the process entry."""
+    def set_automation_release_keys(self, keys) -> None:
+        """Set foreground keys that must be released on pause/stop/result."""
+        valid = {str(key).lower() for key in keys if str(key).lower() in self.KEY_MAP}
+        if valid:
+            self._automation_release_keys = valid
+
+    def request_shutdown(self, reason: str = "manual") -> None:
+        """Stop automation and record the action that requested process exit."""
         self._shutdown_requested = True
+        self._shutdown_reason = str(reason or "manual")
         self._paused = False
         self._running = False
         self.release_automation_inputs()
@@ -636,9 +1147,7 @@ class Controller:
         """
 
         def _on_start() -> None:
-            self._paused = False
-            self._running = True
-            _log.info(">> %s 已启动", self.project_name)
+            self.activate_automation(f"快捷键 {key.upper()}")
             self.show_toast(self.project_name, "已启动")
 
         _log.info("按 %s 启动", key)
@@ -651,14 +1160,28 @@ class Controller:
         """
 
         def _on_stop() -> None:
-            self._running = False
-            self._paused = False
-            self.release_automation_inputs()
+            # F2 is a local automation stop.  Chiaki remains open so the user
+            # can inspect the current game state or start the run again.
+            self.request_shutdown("manual_hotkey")
             _log.info("<< %s 已停止 按启动键重新开始", self.project_name)
             self.show_toast(self.project_name, "已停止，按启动键重新开始")
 
         _log.info("按 %s 停止", key)
         self._register_hotkey(key, _on_stop)
+
+    def set_close_chiaki_key(
+        self, key: str = "f5", modifiers: tuple[str, ...] = ("ctrl", "shift")
+    ) -> None:
+        """Register a distinct modifier-combination that also closes Chiaki."""
+
+        def _on_close() -> None:
+            self.request_shutdown("close_chiaki_hotkey")
+            _log.info("<< %s 已停止并请求关闭 Chiaki", self.project_name)
+            self.show_toast(self.project_name, "已停止并关闭 Chiaki（组合键）")
+
+        self._register_hotkey_combo(key, modifiers, _on_close)
+        combo_text = "+".join((*modifiers, key)).upper()
+        _log.info("按 %s 停止并关闭 Chiaki", combo_text)
 
     def set_battle_pause_key(self, key: str) -> None:
         """Register a pause/resume hotkey which preserves the battle phase."""
@@ -679,6 +1202,42 @@ class Controller:
 
         _log.info("按 %s 暂停/继续", key)
         self._register_hotkey(key, _on_toggle_pause)
+
+    def set_window_recapture_key(self, key: str = "f4") -> None:
+        """Register a manual window recapture command for the control panel."""
+
+        def _on_recapture() -> None:
+            previous = self._target_hwnd
+            if self._expected_process_id and not self.process_is_alive(
+                self._expected_process_id
+            ):
+                self._expected_process_id = None
+            self._target_hwnd = None
+            self.window_rect = None
+            hwnd = self._find_window(self.target_window)
+            if hwnd is None:
+                _log.warning(
+                    "手动捕获失败：未找到 Chiaki 串流窗口；可检查窗口是否已打开"
+                )
+                return
+            self._target_hwnd = hwnd
+            self._hwnd_warned = False
+            if self.background_mode and not win32gui.IsIconic(hwnd):
+                try:
+                    self._start_background_capture(hwnd, force=True)
+                except Exception:
+                    _log.warning("手动捕获后重绑后台画面失败", exc_info=True)
+                    return
+            _, process_id = win32process.GetWindowThreadProcessId(hwnd)
+            _log.info(
+                "手动捕获成功：Chiaki 串流窗口 hwnd=%s, PID=%s%s",
+                hwnd,
+                process_id,
+                "（已替换旧窗口）" if previous and previous != hwnd else "",
+            )
+
+        _log.info("按 %s 重新捕获 Chiaki 串流窗口", key)
+        self._register_hotkey(key, _on_recapture)
 
     # ============================================================
     #  Win11 风格 Toast 通知（tkinter 圆角阴影 + 滑入滑出动画）
@@ -879,6 +1438,31 @@ class Controller:
         _log.debug("注册热键: '%s' (0x%02X)", key, vk)
         self._start_hotkey()
 
+    def _register_hotkey_combo(
+        self, key: str, modifiers: tuple[str, ...], callback: callable
+    ) -> None:
+        """Register a key that fires only while every modifier is held."""
+        key_vk = self.KEY_MAP.get(key.lower())
+        if key_vk is None:
+            raise ValueError(f"未知的热键名: '{key}'")
+        modifier_vks: list[int] = []
+        for modifier in modifiers:
+            modifier_vk = self.KEY_MAP.get(str(modifier).lower())
+            if modifier_vk is None:
+                raise ValueError(f"未知的组合键修饰键: '{modifier}'")
+            if modifier_vk not in modifier_vks:
+                modifier_vks.append(modifier_vk)
+        if not modifier_vks:
+            raise ValueError("组合键至少需要一个修饰键")
+        combo = (key_vk, tuple(sorted(modifier_vks)))
+        self._hotkey_combos[combo] = callback
+        _log.debug(
+            "注册组合热键: key=0x%02X modifiers=%s",
+            key_vk,
+            ",".join(f"0x{vk:02X}" for vk in combo[1]),
+        )
+        self._start_hotkey()
+
     def _start_hotkey(self) -> None:
         """启动后台热键监听线程（幂等）"""
         if self._hotkey_thread is not None:
@@ -889,21 +1473,64 @@ class Controller:
 
     def _hotkey_loop(self) -> None:
         """后台线程：轮询 GetAsyncKeyState 检测热键按下"""
-        prev: dict[int, bool] = {}
+        prev: dict[tuple[object, ...], bool] = {}
         while True:
             for vk, cb in list(self._hotkeys.items()):
                 pressed = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
-                if pressed and not prev.get(vk, False):
+                event_key = ("key", vk)
+                if pressed and not prev.get(event_key, False):
                     _log.debug("热键触发: 0x%02X", vk)
                     cb()
-                prev[vk] = pressed
+                prev[event_key] = pressed
+            for (key_vk, modifier_vks), cb in list(self._hotkey_combos.items()):
+                pressed = bool(
+                    ctypes.windll.user32.GetAsyncKeyState(key_vk) & 0x8000
+                ) and all(
+                    bool(ctypes.windll.user32.GetAsyncKeyState(modifier_vk) & 0x8000)
+                    for modifier_vk in modifier_vks
+                )
+                event_key = ("combo", key_vk, *modifier_vks)
+                if pressed and not prev.get(event_key, False):
+                    _log.debug(
+                        "组合热键触发: key=0x%02X modifiers=%s",
+                        key_vk,
+                        ",".join(f"0x{vk:02X}" for vk in modifier_vks),
+                    )
+                    cb()
+                prev[event_key] = pressed
             sleep(0.05)
 
-    def ocr(self, pic: Image, confidence=0.6):
+    def ui_language_candidates(self) -> tuple[str, ...]:
+        """Return the OCR languages that should be tried for the current run."""
+        if self.detected_ui_language is not None:
+            return (self.detected_ui_language,)
+        return ("zh", "ja")
+
+    def confirm_ui_language(self, language: str, evidence: str = "") -> None:
+        """Lock automatic language detection after a language-specific marker."""
+        if self.ui_language_mode != "auto" or language not in {"zh", "ja"}:
+            return
+        with self._ui_language_lock:
+            if self.detected_ui_language is not None:
+                return
+            self.detected_ui_language = language
+        label = "简体中文" if language == "zh" else "日文"
+        suffix = f"（依据：{evidence}）" if evidence else ""
+        _log.info("界面语言已识别：%s%s", label, suffix)
+
+    def _ocr_model_for(self, language: str | None):
+        selected = language or self.detected_ui_language or "zh"
+        model = self.ocrmodels.get(selected)
+        if model is None:
+            raise RuntimeError(f"OCR language model is unavailable: {selected}")
+        return model, selected
+
+    def ocr(self, pic: Image, confidence=0.6, language: str | None = None):
         # RapidOCR can be called by multiple phase checks. Serialize inference
         # so concurrent frame checks cannot corrupt or stall the ONNX session.
+        model, selected_language = self._ocr_model_for(language)
         with self._ocr_lock:
-            result = self.ocrmodel(pic, use_det=True, use_cls=False)
+            result = model(pic, use_det=True, use_cls=False)
 
         if result is None or result[0] is None or len(result[0]) == 0:
             _log.debug("OCR: 未识别到文本")
@@ -924,10 +1551,20 @@ class Controller:
                 ocr_result_list.append(d)
 
         texts = [t["text"] for t in ocr_result_list]
-        _log.debug("OCR: %d 个文本 → %s", len(ocr_result_list), texts)
+        _log.debug(
+            "OCR[%s]: %d 个文本 → %s",
+            selected_language,
+            len(ocr_result_list),
+            texts,
+        )
         return ocr_result_list
 
-    def recognize_line(self, pic: Image, confidence: float = 0.65) -> str:
+    def recognize_line(
+        self,
+        pic: Image,
+        confidence: float = 0.65,
+        language: str | None = None,
+    ) -> str:
         """Recognize one fixed-position text line without running detection.
 
         GBFR's battle markers live in stable normalized regions.  Sending the
@@ -935,8 +1572,9 @@ class Controller:
         expensive text detector while retaining OCR tolerance for resolution
         and stream-compression changes.
         """
+        model, selected_language = self._ocr_model_for(language)
         with self._ocr_lock:
-            result = self.ocrmodel(pic, use_det=False, use_cls=False)
+            result = model(pic, use_det=False, use_cls=False)
 
         if result is None or result[0] is None or len(result[0]) == 0:
             return ""
@@ -944,7 +1582,12 @@ class Controller:
         if len(item) < 2 or float(item[1]) < confidence:
             return ""
         text = str(item[0]).strip()
-        _log.debug("单行识别: '%s' (%.3f)", text, float(item[1]))
+        _log.debug(
+            "单行识别[%s]: '%s' (%.3f)",
+            selected_language,
+            text,
+            float(item[1]),
+        )
         return text
 
     # ----------------------------------------------------------
@@ -1061,21 +1704,10 @@ class Controller:
     def click(self, x=200, y=200, key="left", times=1, interval=0):
         _log.debug("点击%s: (%d, %d) x%d", key, x, y, times)
         if self.background_mode:
-            hwnd = self._get_hwnd()
-            if hwnd is None:
-                return
-            button_messages = {
-                "left": (win32con.WM_LBUTTONDOWN, win32con.WM_LBUTTONUP),
-                "right": (win32con.WM_RBUTTONDOWN, win32con.WM_RBUTTONUP),
-                "middle": (win32con.WM_MBUTTONDOWN, win32con.WM_MBUTTONUP),
-            }
-            down, up = button_messages.get(key, button_messages["left"])
-            lparam = (int(y) << 16) | (int(x) & 0xFFFF)
-            for _ in range(times):
-                ctypes.windll.user32.PostMessageW(hwnd, down, 0, lparam)
-                sleep(0.1)
-                ctypes.windll.user32.PostMessageW(hwnd, up, 0, lparam)
-                sleep(interval)
+            # Background automation is controller-only. Suppressing this
+            # legacy mouse protocol guarantees it never changes the desktop
+            # cursor or injects a window click while the user works elsewhere.
+            _log.warning("后台模式已忽略鼠标点击动作；自动重战仅使用虚拟手柄输入")
             return
 
         self.focus_window()
@@ -1267,6 +1899,7 @@ class Controller:
             "bs": vg.DS4_BUTTONS.DS4_BUTTON_CIRCLE,
             "3": vg.DS4_BUTTONS.DS4_BUTTON_SHOULDER_RIGHT,
             "\\": vg.DS4_BUTTONS.DS4_BUTTON_SQUARE,
+            "c": vg.DS4_BUTTONS.DS4_BUTTON_TRIANGLE,
         }
         if normalized in button_map:
             if pressed:
@@ -1339,7 +1972,7 @@ class Controller:
         times: int = 1,
         interval: float = 0,
         movement: str = "press_and_release",
-    ) -> None:
+    ) -> bool:
         """使用裸 ctypes SendInput 模拟键盘按键
 
         :param key:      按键名（同 KEY_MAP 中的键名）
@@ -1350,25 +1983,55 @@ class Controller:
         # A release must always be allowed so pausing or a phase transition can
         # neutralize a key that was pressed just before the state changed.
         if self._paused and movement != "release":
-            return
+            return False
 
-        vk = self.KEY_MAP.get(key.lower())
+        normalized = key.lower()
+        vk = self.KEY_MAP.get(normalized)
         if vk is None:
             raise ValueError(f"未知的按键名: '{key}'，请检查 KEY_MAP")
 
         _log.debug("按键: '%s' (0x%02X) x%d", key, vk, times)
-        hwnd = self._get_hwnd()
+        try:
+            hwnd = self._get_hwnd()
+        except Exception:
+            _log.warning("目标窗口查询异常，跳过按键 '%s'", key, exc_info=True)
+            return False
         if self.background_mode and hwnd is None:
-            return
+            _log.warning("后台按键目标窗口不可用，跳过按键 '%s'", key)
+            return False
         if not self.background_mode:
-            self.focus_window()
+            # Do not let SendInput leak into whichever application happens to
+            # be foreground after Chiaki closes or its title changes. A release
+            # of a key we already pressed is the only safe exception.
+            if movement == "release" and normalized in self._foreground_pressed_keys:
+                self._send_key(vk, keyup=True)
+                self._foreground_pressed_keys.discard(normalized)
+                return True
+            if hwnd is None:
+                _log.warning("前台按键目标窗口不可用，跳过按键 '%s'", key)
+                return False
+            if not self.focus_window():
+                _log.warning("目标窗口未能获得焦点，跳过按键 '%s'", key)
+                return False
         for _ in range(times):
+            if not self.background_mode and movement != "release":
+                # Revalidate between repeated pulses. Chiaki can be closed or
+                # rebound while the first pulse is sleeping; never continue
+                # with SendInput after that boundary.
+                try:
+                    if self._get_hwnd() is None or not self.focus_window():
+                        _log.warning("重复按键期间目标窗口失效，停止按键 '%s'", key)
+                        return False
+                except Exception:
+                    _log.warning("重复按键期间目标窗口查询失败，停止按键 '%s'", key, exc_info=True)
+                    return False
             if movement != "release":
                 if self.background_mode:
                     if not self._set_virtual_key(key, pressed=True):
                         self._post_key(hwnd, vk)
                 else:
                     self._send_key(vk)
+                    self._foreground_pressed_keys.add(normalized)
             sleep(0.2)
             if movement != "press":
                 if self.background_mode:
@@ -1376,7 +2039,9 @@ class Controller:
                         self._post_key(hwnd, vk, keyup=True)
                 else:
                     self._send_key(vk, keyup=True)
+                    self._foreground_pressed_keys.discard(normalized)
             sleep(interval)
+        return True
 
     def start(self, func):
         while not self.shutdown_requested:

@@ -1,6 +1,6 @@
 # Binary release notices
 
-Release candidate: **v0.1.0 (Windows build V26, 2026-08-01)**.
+Release candidate: **v0.1.0 (Windows build V41, 2026-08-03)**.
 
 This candidate is for private testing and archival only while the blockers in
 `PUBLISH_BLOCKERS.md` remain unresolved. These notices do not create permission
