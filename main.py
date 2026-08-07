@@ -3,6 +3,7 @@
 # ============================================================
 
 import threading
+from contextlib import contextmanager
 from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -21,7 +22,13 @@ import tkinter as tk
 import tkinter.scrolledtext as scrolledtext
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import webbrowser
-from module.controller import Controller, WindowsCapture, vg
+from module.controller import (
+    Controller,
+    RECOGNITION_PROFILES,
+    WindowsCapture,
+    adjust_window_rect_ex,
+    vg,
+)
 from module.ability_reroll import (
     ABILITY_ATTRIBUTE_ALIASES,
     ABILITY_STOP_MODE_ATTRIBUTES,
@@ -40,7 +47,7 @@ from module.psn_account import LOGIN_URL, account_id_from_redirect, run_account_
 import argparse
 import math
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 
 log = logging.getLogger("GBFR")
 
@@ -74,15 +81,21 @@ REFOCUS_MODE_RANGED = "ranged"
 REFOCUS_MODE_BOSS_RING = "boss_ring"
 REFOCUS_MODE_L2_RING = "l2_ring"
 REFOCUS_MODE_L2_SBA = "l2_sba"
+REFOCUS_MODE_SBA_RING_GUARDED = "sba_ring_guarded"
+REFOCUS_MODE_RING_ARC_EXPERIMENT = "ring_arc_experiment"
 REFOCUS_MODE_LABELS = {
     REFOCUS_MODE_MELEE: "索敌方案 1",
     REFOCUS_MODE_RANGED: "索敌方案 2",
     REFOCUS_MODE_BOSS_RING: "索敌方案 3",
     REFOCUS_MODE_L2_RING: "索敌方案 4",
     REFOCUS_MODE_L2_SBA: "索敌方案 5",
+    REFOCUS_MODE_SBA_RING_GUARDED: "索敌方案 6",
+    REFOCUS_MODE_RING_ARC_EXPERIMENT: "索敌方案 7（圆弧+奥义保护）",
 }
 REFOCUS_MODE_DEFAULT = REFOCUS_MODE_MELEE
 REFOCUS_MODE = REFOCUS_MODE_DEFAULT
+DEBUG_MODE = False
+DEBUG_DIAGNOSTIC_PATH: Path | None = None
 REMOTE_REFOCUS_SBA_POLL_SECONDS = 10.0
 REMOTE_REFOCUS_SKILL_POLL_SECONDS = 1.0
 REMOTE_REFOCUS_SKILL_STATIC_SECONDS = 15.0
@@ -96,6 +109,16 @@ L2_RING_PRESENT_MIN_SAMPLES = 2
 L2_RING_MISSING_CONFIRMATIONS = 2
 L2_SBA_PROBE_INTERVAL_SECONDS = 3.0
 L2_SBA_GROWTH_EPSILON = 0.01
+L2_SBA_RING_GUARDED_PROBE_INTERVAL_SECONDS = 3.0
+L2_SBA_RING_GUARDED_L2_COOLDOWN_SECONDS = 10.0
+L2_SBA_RING_GUARDED_MISSING_GROUPS = 4
+L2_SBA_RING_GUARDED_RECOVER_ATTEMPTS = 2
+L2_SBA_RING_GUARDED_RECENT_GROWTH_SECONDS = 8.0
+L2_SBA_RING_GUARDED_RELEASE_PROTECTION_SECONDS = 8.0
+RING_ARC_EXPERIMENT_POLL_SECONDS = 0.75
+RING_ARC_EXPERIMENT_TRACK_SECONDS = 1.6
+RING_ARC_EXPERIMENT_TRACK_CENTER_DISTANCE = 0.14
+RING_ARC_EXPERIMENT_TRACK_RADIUS_RATIO = 0.42
 L2_BOSS_RING_PROBE_INTERVAL_SECONDS = 3.0
 L2_BOSS_RING_SAMPLE_INTERVAL_SECONDS = 0.12
 L2_BOSS_RING_CONFIRM_SAMPLES = 3
@@ -142,9 +165,13 @@ UI_MARKERS = {
         # This modal can be rendered over the quest-center background, so it
         # must be classified before the broader ``quest_destination`` marker.
         "town_collection_list": ("收藏列表",),
+        # L2 in town opens the quick-travel overlay on some clients. It must
+        # be closed before the quest-center macro is allowed to run.
+        "town_fast_travel": ("移动目的地", "移动先", "简易移动"),
         "quest_destination": ("任务中心",),
         "quest_counter": ("任务中心", "任务选择"),
         "quest_accepted": ("已承接任务", "开始任务"),
+        "quest_abandon_confirmation": ("放弃已承接", "取消任务", "放弃任务"),
         "quest_page": (
             "任务中心",
             "任务选择",
@@ -166,21 +193,47 @@ UI_MARKERS = {
         # Japanese result prompts sit very close to the right edge. OCR may
         # return a katakana-lookalike for the second character, so keep the
         # common variants while the crop remains limited to the prompt area.
-        "result_continue": ("次へ", "次ヘ", "次へ進む"),
+        # At smaller Chiaki client sizes RapidOCR may retain only the final
+        # glyph from the bottom-right prompt. This marker is used exclusively
+        # in the narrow ``继续`` crop and still requires two fresh frames.
+        "result_continue": ("次へ", "次ヘ", "次へ進む", "へ"),
         # Native-size recognition can confuse 挑 with 規 on the compressed
         # result prompt. The crop is restricted to this one control, so this
         # is a safe Japanese-only OCR fallback.
-        "result_retry_available": ("再挑戦する", "再規戦する", "再挑戦す", "再規戦す"),
+        "result_retry_available": (
+            "再挑戦する",
+            "再規戦する",
+            "再挑戦す",
+            "再規戦す",
+            # Low-resolution Japanese OCR variants from the supplied result
+            # page. These are accepted only in the dedicated lower-left crop.
+            "再排殺する",
+            "回事排殺する",
+            "再挑殺する",
+            "再排戦する",
+            "再排製する",
+            "ロ事排殺する",
+            # The first two glyphs remain stable in the left-quarter crop;
+            # accept this prefix when the final Japanese characters are lost.
+            "再排",
+        ),
         "result_retry_cancel": ("キャンセル", "挑戦をキ"),
         "result_retry_any": ("再挑戦", "再規戦", "キャンセル", "挑戦をキ"),
         "result_screen": ("再挑戦", "再規戦", "リザルト確認", "BATTLE RESULT"),
-        "settlement": ("リザルト",),
-        "confirmation": ("確認",),
+        # The Japanese title is small and blurred on low-size clients. The
+        # center-crop OCR can turn リザルト確認 into リサルト確調/確譚; these
+        # variants are used only by the settlement center crop.
+        "settlement": ("リザルト", "リサルト", "リザルト確"),
+        "confirmation": ("確認", "確調", "確譚"),
         # The 10-battle confirmation is read from the same central ``结算``
         # crop as the Chinese prompt.  Until a Japanese capture confirms the
         # exact wording, accept the short OCR forms as an event signal and
         # reuse the Chinese W + Cross action sequence.
-        "challenge_confirmation": ("再挑戦", "再規戦", "挑戦", "再戦", "戦"),
+        # Never use the single glyph ``戦`` here: normal result objectives
+        # contain ``戦闘`` and can appear on the same center crop. A challenge
+        # page must have a challenge phrase or a complete choice pair.
+        "challenge_confirmation": ("再挑戦", "再規戦", "再戦", "挑戦する"),
+        "challenge_confirmation_retry": ("再挑戦確認", "再規戦確認"),
         "movie": ("スキップ", "SKIP"),
         "game_menu": (
             "メインメニュー",
@@ -193,12 +246,24 @@ UI_MARKERS = {
             "絞り込み",
         ),
         "town_collection_list": ("お気に入り一覧", "お気に入りリスト", "コレクション一覧"),
+        "town_fast_travel": (
+            "移動先選択",
+            "移動先遥",
+            "簡易移動",
+            "簡易移動先",
+            "移動先",
+        ),
         "quest_destination": ("クエストカウンター",),
         "quest_counter": ("クエストカウンター", "クエスト選択"),
         # ``受注クエスト確認`` is a normal quest-counter menu entry, not proof
         # that a quest was accepted. Only the completion toast/ready prompt can
         # advance recovery to the Square step.
         "quest_accepted": ("受注しました", "準備OK"),
+        "quest_abandon_confirmation": (
+            "受注中のクエストを破棄",
+            "クエストを破棄",
+            "クエストをキャンセル",
+        ),
         "quest_page": (
             "クエストカウンター",
             "クエスト受注",
@@ -239,9 +304,37 @@ BATTLE_HUD_CONFIRM_INTERVAL_SECONDS = 0.55
 # icon in the right side of the left ``结算进度/リザルトの進行状況`` row.  Its
 # gold check is enabled; the gray icon means the option is still available.
 RESULT_REPEAT_INDICATOR_REGION = (0.22, 0.70, 0.25, 0.74)
-RESULT_REPEAT_GOLD_MIN_FRACTION = 0.04
+# Search inside the user-marked lower-left result panel, but score only small
+# local windows around the status icon. The whole panel is about 8.9% of a
+# 540P frame and averaging it would dilute the actual gold signal.
+RESULT_REPEAT_INDICATOR_SEARCH_REGION = (0.16, 0.66, 0.27, 0.81)
+# The 540P icon crop contains dark result-background gradients and thin gold
+# UI lines. A 4% threshold treated those unrelated pixels as an enabled icon.
+# Require a denser, more saturated gold signal inside the marked position.
+RESULT_REPEAT_GOLD_MIN_FRACTION = 0.10
+# The first BATTLE RESULT summary page has only 次へ. The retry page adds a
+# lower-left blue action bar. Use the bar as a visual page discriminator when
+# the Japanese text is still unreadable; otherwise a strict retry guard would
+# incorrectly block the summary page before it can advance to the control.
+RESULT_REPEAT_CONTROL_REGION = (0.03, 0.89, 0.25, 0.925)
+RESULT_REPEAT_CONTROL_BLUE_MIN_FRACTION = 0.20
+# The white circular PS5 button glyph at the left edge of the retry bar is a
+# smaller and more stable page marker than the bar's changing blue background.
+RESULT_REPEAT_PS_BUTTON_REGION = (0.065, 0.875, 0.135, 0.93)
+RESULT_REPEAT_PS_BUTTON_MIN_FRACTION = 0.018
+# Secondary Japanese-page fallback. This is only the reward row containing
+# ``獲得MSP`` and its value, not the whole upper half of the frame.
+RESULT_MSP_MARKER_REGION = (0.25, 0.12, 0.62, 0.23)
+RESULT_MSP_MARKER_MIN_DIGITS = 1
+# The Japanese ``次へ`` glyph can disappear from OCR at 540P. This is only a
+# result-phase fallback; it is never used by the general battle recognizer.
+RESULT_CONTINUE_VISUAL_REGION = (0.80, 0.88, 0.995, 0.995)
+RESULT_CONTINUE_VISUAL_MIN_FRACTION = 0.004
 RESULT_REPEAT_CONFIRM_SAMPLES = 2
 RESULT_REPEAT_CONFIRM_TIMEOUT_SECONDS = 4.5
+# A Japanese 540P result summary may require several Cross inputs before the
+# lower-left retry page is rendered. Stop immediately once that page appears.
+JAPANESE_RESULT_CONTINUE_MAX_PRESSES = 3
 # A dropped virtual-controller report can leave the visible result page in
 # the still-available state. Retry only after that state is stable; Square is
 # a toggle, so this must remain deliberately bounded.
@@ -277,16 +370,109 @@ TOWN_READY_DIALOG_MIN_DARK_BLUE_FRACTION = 0.65
 TOWN_READY_DIALOG_READY_REGION = (0.40, 0.715, 0.60, 0.775)
 TOWN_READY_DIALOG_CANCEL_REGION = (0.40, 0.765, 0.60, 0.835)
 TOWN_READY_DIALOG_SELECTION_MIN_DELTA = 0.10
+# The Japanese destination list is a large left-side overlay. A dedicated
+# crop avoids full-frame OCR being dominated by the character and town HUD.
+TOWN_DESTINATION_MENU_REGION = (0.14, 0.12, 0.80, 0.90)
+# A successful Box/Cross can be followed by a long loading transition on a
+# remote client. Do not re-send inputs during this interval: the prior input
+# may already have accepted the quest.
+TOWN_RECOVERY_NAVIGATION_TIMEOUT_SECONDS = 120.0
+TOWN_RECOVERY_BATTLE_CONFIRM_TIMEOUT_SECONDS = 60.0
+TOWN_RECOVERY_DEBUG_REPORT_SECONDS = 10.0
 AUTOMATION_INPUT_LOCK = threading.Lock()
+# The input lock only serializes individual controller operations.  A town
+# recovery, reconnect route, or ability reroll is a multi-step transaction and
+# must not be interrupted by a watchdog deciding to recover the stream midway.
+_AUTOMATION_FLOW_STATE_LOCK = threading.RLock()
+_AUTOMATION_FLOW_OWNER: int | None = None
+_AUTOMATION_FLOW_STACK: list[str] = []
+_AUTOMATION_FLOW_STARTED_AT: float | None = None
 _CAPTURE_UNAVAILABLE_WARNED = False
 SESSION_STATS = None
 SCHEDULE_FILE: Path | None = None
 RECOVERY_CONFIG: dict[str, object] = {}
-INITIAL_AUTOMATION_PHASE = "battle_wait"
+INITIAL_AUTOMATION_PHASE = "startup_probe"
 PS5_DISCOVERY_PORT = 9302
 PS5_DISCOVERY_PROTOCOL_VERSION = "00030010"
 PS5_DISCOVERY_LOCAL_PORT_MIN = 9303
 PS5_DISCOVERY_LOCAL_PORT_MAX = 9319
+
+
+def automation_flow_active() -> bool:
+    """Return whether a multi-step automation transaction owns navigation."""
+    with _AUTOMATION_FLOW_STATE_LOCK:
+        return bool(_AUTOMATION_FLOW_STACK)
+
+
+def automation_flow_name() -> str | None:
+    """Return the active transaction path for diagnostics and watchdog logs."""
+    with _AUTOMATION_FLOW_STATE_LOCK:
+        if not _AUTOMATION_FLOW_STACK:
+            return None
+        return " > ".join(_AUTOMATION_FLOW_STACK)
+
+
+def _begin_automation_flow(name: str) -> bool:
+    """Claim a re-entrant transaction for the current thread without blocking."""
+    global _AUTOMATION_FLOW_OWNER, _AUTOMATION_FLOW_STARTED_AT
+    owner = threading.get_ident()
+    with _AUTOMATION_FLOW_STATE_LOCK:
+        if _AUTOMATION_FLOW_OWNER not in (None, owner):
+            return False
+        if _AUTOMATION_FLOW_OWNER is None:
+            _AUTOMATION_FLOW_OWNER = owner
+            _AUTOMATION_FLOW_STARTED_AT = monotonic()
+        _AUTOMATION_FLOW_STACK.append(name)
+        return True
+
+
+def _finish_automation_flow(name: str) -> None:
+    """Release one transaction level held by the current thread."""
+    global _AUTOMATION_FLOW_OWNER, _AUTOMATION_FLOW_STARTED_AT
+    owner = threading.get_ident()
+    with _AUTOMATION_FLOW_STATE_LOCK:
+        if _AUTOMATION_FLOW_OWNER != owner or not _AUTOMATION_FLOW_STACK:
+            return
+        if _AUTOMATION_FLOW_STACK[-1] != name:
+            log.error(
+                "自动化流程保护释放顺序异常：当前=%s，尝试释放=%s",
+                automation_flow_name(),
+                name,
+            )
+            return
+        _AUTOMATION_FLOW_STACK.pop()
+        if not _AUTOMATION_FLOW_STACK:
+            _AUTOMATION_FLOW_OWNER = None
+            _AUTOMATION_FLOW_STARTED_AT = None
+
+
+@contextmanager
+def automation_flow(name: str):
+    """Protect a high-level navigation flow from asynchronous recovery input."""
+    acquired = _begin_automation_flow(name)
+    if acquired:
+        log.debug("自动化流程保护进入：%s", automation_flow_name())
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            _finish_automation_flow(name)
+            log.debug("自动化流程保护退出：%s", name)
+
+
+def clear_automation_flow_state(reason: str) -> None:
+    """Clear a stale transaction during explicit shutdown or state-machine exit."""
+    global _AUTOMATION_FLOW_OWNER, _AUTOMATION_FLOW_STARTED_AT
+    with _AUTOMATION_FLOW_STATE_LOCK:
+        if _AUTOMATION_FLOW_STACK:
+            log.warning(
+                "清除未完成的自动化流程保护（%s）：%s",
+                reason,
+                " > ".join(_AUTOMATION_FLOW_STACK),
+            )
+        _AUTOMATION_FLOW_STACK.clear()
+        _AUTOMATION_FLOW_OWNER = None
+        _AUTOMATION_FLOW_STARTED_AT = None
 
 OCR_RUNTIME_DEPENDENCIES = {
     "onnxruntime": "onnxruntime",
@@ -389,13 +575,35 @@ ABILITY_RESULT_MARKERS = (
     "能力值覆盖确认",
     "能力值提升效果",
     "新的能力提升效果",
+    "ステータス上書き確認",
+    "新たに獲得したステータス",
 )
 ABILITY_SUCCESS_MARKERS = (
     "Over the Limit",
     "上限突破成功",
     "突破成功",
 )
-ABILITY_CONFIRM_MARKERS = ("执行", "執行", "Execute")
+ABILITY_CONFIRM_MARKERS = ("执行", "執行", "実行", "Execute")
+# These are deliberately language-exclusive page labels.  ``上限突破`` itself
+# is shared by the Chinese and Japanese clients, so it must never lock OCR to
+# either model on its own.
+ABILITY_LANGUAGE_MARKERS = {
+    "zh": (
+        "有几率不提升基础能力值",
+        "可获得的能力值",
+        "消耗MSP进行上限突破",
+        "当前能力值提升效果",
+        "新的能力提升效果",
+        "能力值覆盖确认",
+    ),
+    "ja": (
+        "ステータス上書き確認",
+        "新たに獲得したステータス",
+        "現在の能力値上昇効果",
+        "上限突破を行う",
+        "上限突破を実行",
+    ),
+}
 ABILITY_NAVIGATION_MAX_STEPS = 4
 ABILITY_NAVIGATION_SETTLE_SECONDS = 0.75
 ABILITY_SUCCESS_SETTLE_SECONDS = 2.0
@@ -403,11 +611,19 @@ ABILITY_SUCCESS_CONTINUE_INTERVAL_SECONDS = 1.0
 ABILITY_REROLL_SETTLE_SECONDS = 0.8
 ABILITY_ACCEPT_HIGHLIGHT_SETTLE_SECONDS = 0.8
 ABILITY_RESULT_TIMEOUT_SECONDS = 90.0
+ABILITY_OCR_PASSES = 3
+# Candidate, execution-confirmation, and success pages each have a strict
+# structural classifier.  A second full-screen OCR pass adds several seconds
+# on 1080p streams without making those transitions safer.  The final
+# overwrite result is different: it contains the data used for a destructive
+# decision, so it deliberately remains double-checked.
+ABILITY_STAGE_DOUBLE_CHECK = frozenset({"result"})
 ABILITY_QUALIFIED_SOUND_FILE = "ability-qualified.wav"
 ABILITY_CURRENT_EFFECT_MARKERS = (
     "当前能力值提升效果",
     "目前能力值提升效果",
     "現在の能力値上昇効果",
+    "現在の効果",
 )
 ABILITY_RELINK_DICT = {
     # The ability feature deliberately captures the full client area. The
@@ -1527,6 +1743,185 @@ def l2_target_ring_snapshot(relink: Controller) -> tuple[bool, dict[str, float]]
     return detect_l2_target_ring_pixels(np.asarray(pixels, dtype=np.uint8))
 
 
+def detect_l2_target_ring_arcs(pixels: np.ndarray) -> tuple[bool, dict[str, float]]:
+    """Detect a thin partial gold target ring instead of a complete yellow circle.
+
+    Lock rings are frequently occluded by enemies, damage numbers and visual
+    effects.  This experiment scores the continuity and thickness of gold
+    perimeter arcs, accepting a stable partial arc while rejecting broad,
+    filled combat effects. It supplies visual evidence to scheme 7, whose
+    input decisions also require the conservative SBA inactivity policy.
+    """
+    array = np.asarray(pixels, dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] < 3 or array.shape[0] < 16 or array.shape[1] < 16:
+        return False, {"score": 0.0, "arc_sectors": 0.0, "max_arc_run": 0.0}
+
+    # Four-pixel sampling preserves the 40-100 px stream rings while keeping
+    # high-frequency observation inexpensive enough for a live battle.
+    sampled = array[::4, ::4, :3].astype(np.int16)
+    red, green, blue = sampled[:, :, 0], sampled[:, :, 1], sampled[:, :, 2]
+    # The lock UI is a saturated orange-gold outline.  Brighter, nearly white
+    # flashes and purple/red combat effects are excluded before geometry work.
+    gold = (
+        (red >= 145)
+        & (green >= 78)
+        & (blue <= 142)
+        & (red >= green + 18)
+        & (green >= blue + 16)
+        & ((red - blue) >= 72)
+    )
+    height, width = gold.shape
+    if not gold.any():
+        return False, {"score": 0.0, "arc_sectors": 0.0, "max_arc_run": 0.0}
+
+    luma = red * 0.30 + green * 0.59 + blue * 0.11
+    gradient_y, gradient_x = np.gradient(luma.astype(np.float32))
+    edge = np.hypot(gradient_x, gradient_y) >= 20.0
+    angles = np.linspace(0.0, 2.0 * np.pi, 36, endpoint=False)
+    offsets_by_radius: dict[int, list[tuple[int, int]]] = {}
+    min_radius = max(7, int(min(height, width) * 0.035))
+    max_radius = max(min_radius, min(46, int(min(height, width) * 0.23)))
+    best: dict[str, float] = {
+        "score": 0.0,
+        "arc_sectors": 0.0,
+        "max_arc_run": 0.0,
+        "center_x": 0.0,
+        "center_y": 0.0,
+        "radius": 0.0,
+        "thinness": 0.0,
+        "edge_sectors": 0.0,
+        "interior_gold": 0.0,
+    }
+
+    for radius in range(min_radius, max_radius + 1, 2):
+        offsets = offsets_by_radius.setdefault(
+            radius,
+            [(int(round(math.sin(angle) * radius)), int(round(math.cos(angle) * radius))) for angle in angles],
+        )
+        votes = np.zeros((height, width), dtype=np.uint8)
+        edge_votes = np.zeros((height, width), dtype=np.uint8)
+        for offset_y, offset_x in offsets:
+            source_y0 = max(0, offset_y)
+            source_y1 = min(height, height + offset_y)
+            source_x0 = max(0, offset_x)
+            source_x1 = min(width, width + offset_x)
+            target_y0 = max(0, -offset_y)
+            target_y1 = target_y0 + (source_y1 - source_y0)
+            target_x0 = max(0, -offset_x)
+            target_x1 = target_x0 + (source_x1 - source_x0)
+            votes[target_y0:target_y1, target_x0:target_x1] += gold[source_y0:source_y1, source_x0:source_x1]
+            edge_votes[target_y0:target_y1, target_x0:target_x1] += edge[source_y0:source_y1, source_x0:source_x1]
+
+        # Partial arcs only need enough perimeter support to locate a center.
+        support = votes.astype(np.float32) * 0.65 + edge_votes.astype(np.float32) * 0.35
+        support[:radius, :] = 0.0
+        support[-radius:, :] = 0.0
+        support[:, :radius] = 0.0
+        support[:, -radius:] = 0.0
+        # The left party HUD, top boss HUD and bottom control HUD produce
+        # stable orange arcs during skill cut-ins. A real target ring stays in
+        # the central combat field for this experiment.
+        support[: int(height * 0.15), :] = 0.0
+        support[int(height * 0.85) :, :] = 0.0
+        support[:, : int(width * 0.20)] = 0.0
+        support[:, int(width * 0.82) :] = 0.0
+        center_y, center_x = np.unravel_index(int(np.argmax(support)), support.shape)
+        if support[center_y, center_x] < 8.0:
+            continue
+
+        sector_hits: list[bool] = []
+        sector_edges: list[bool] = []
+        radial_hits: list[int] = []
+        for offset_y, offset_x in offsets:
+            hits = 0
+            has_edge = False
+            for radial_adjustment in range(-3, 4):
+                scale = (radius + radial_adjustment) / radius
+                y = center_y + int(round(offset_y * scale))
+                x = center_x + int(round(offset_x * scale))
+                if 0 <= y < height and 0 <= x < width:
+                    hits += int(gold[y, x])
+                    has_edge = has_edge or bool(edge[y, x])
+            sector_hits.append(hits >= 1)
+            sector_edges.append(has_edge)
+            radial_hits.append(hits)
+
+        arc_sectors = sum(sector_hits)
+        edge_sectors = sum(sector_edges)
+        doubled = sector_hits + sector_hits
+        max_arc_run = 0
+        current_run = 0
+        for hit in doubled:
+            current_run = current_run + 1 if hit else 0
+            max_arc_run = max(max_arc_run, current_run)
+        max_arc_run = min(max_arc_run, len(sector_hits))
+        hit_thickness = [hit for hit, present in zip(radial_hits, sector_hits) if present]
+        average_thickness = float(np.mean(hit_thickness)) if hit_thickness else 7.0
+        # A thin outlined ring normally occupies one to three sampled radial
+        # pixels. Broad flashes can create circles too, but occupy most of the
+        # seven-pixel radial band and are deliberately penalized.
+        thinness = max(0.0, min(1.0, (5.2 - average_thickness) / 3.2))
+        y0 = max(0, int(center_y - radius * 0.58))
+        y1 = min(height, int(center_y + radius * 0.58) + 1)
+        x0 = max(0, int(center_x - radius * 0.58))
+        x1 = min(width, int(center_x + radius * 0.58) + 1)
+        local_gold = gold[y0:y1, x0:x1]
+        local_y, local_x = np.ogrid[y0:y1, x0:x1]
+        interior = (
+            (local_y - center_y) ** 2 + (local_x - center_x) ** 2
+            <= (radius * 0.55) ** 2
+        )
+        interior_gold = float(local_gold[interior].mean()) if interior.any() else 0.0
+        arc_fraction = arc_sectors / len(sector_hits)
+        edge_fraction = edge_sectors / len(sector_edges)
+        continuity = min(1.0, max_arc_run / 13.0)
+        score = (
+            arc_fraction * 0.42
+            + continuity * 0.30
+            + edge_fraction * 0.18
+            + thinness * 0.10
+        )
+        if score > best["score"]:
+            best = {
+                "score": score,
+                "arc_sectors": float(arc_sectors),
+                "max_arc_run": float(max_arc_run),
+                "center_x": center_x / max(1, width),
+                "center_y": center_y / max(1, height),
+                "radius": float(radius),
+                "thinness": thinness,
+                "edge_sectors": float(edge_sectors),
+                "interior_gold": interior_gold,
+            }
+
+    detected = (
+        best["arc_sectors"] >= 7
+        and best["max_arc_run"] >= 4
+        and best["thinness"] >= 0.20
+        and best["interior_gold"] <= 0.18
+        and best["radius"] <= 30.0
+        and best["score"] >= 0.38
+    )
+    return detected, best
+
+
+def l2_target_ring_arc_snapshot(relink: Controller) -> tuple[bool, dict[str, float]]:
+    """Capture the battle area for scheme 7's partial-arc ring check."""
+    rect = relink.get_window_rect(silent=True)
+    if rect is None:
+        raise RuntimeError("无法读取 Chiaki 窗口尺寸")
+    left, top, width, height = rect
+    pixels = relink.screenshot(
+        region=(
+            left + int(width * 0.08),
+            top + int(height * 0.08),
+            max(8, int(width * 0.84)),
+            max(8, int(height * 0.78)),
+        )
+    )
+    return detect_l2_target_ring_arcs(np.asarray(pixels, dtype=np.uint8))
+
+
 def detect_boss_blue_bar_pixels(pixels: np.ndarray) -> tuple[bool, dict[str, float]]:
     """Detect a moving blue/purple target-bar candidate at multiple scales."""
     array = np.asarray(pixels, dtype=np.uint8)
@@ -1878,6 +2273,251 @@ def l2_sba_focus_watchdog(
             log.debug("L键持续探测实验检测失败（已忽略）", exc_info=True)
 
 
+def sba_ring_guarded_focus_watchdog(
+    relink: Controller, battle_is_active: Callable[[], bool]
+) -> None:
+    """Use SBA activity as the primary guard for low-frequency target recovery.
+
+    The target ring is useful positive evidence but is frequently occluded by
+    boss UI and combat effects. A missing ring therefore only becomes actionable
+    after SBA has also stayed inactive for several samples.
+    """
+    next_probe = 0.0
+    next_l2_allowed = 0.0
+    previous_sba: float | None = None
+    last_sba_growth_at: float | None = None
+    release_protection_until = 0.0
+    missing_groups = 0
+    l2_attempts = 0
+    search_left = True
+
+    while relink.running:
+        if relink.paused or not battle_is_active():
+            next_probe = 0.0
+            next_l2_allowed = 0.0
+            previous_sba = None
+            last_sba_growth_at = None
+            release_protection_until = 0.0
+            missing_groups = 0
+            l2_attempts = 0
+            sleep(0.5)
+            continue
+
+        now = time()
+        if now < next_probe:
+            sleep(min(0.2, next_probe - now))
+            continue
+        next_probe = now + L2_SBA_RING_GUARDED_PROBE_INTERVAL_SECONDS
+
+        try:
+            present_votes = 0
+            observations: list[dict[str, float]] = []
+            for sample_index in range(L2_RING_CONFIRM_SAMPLES):
+                if not relink.running or relink.paused or not battle_is_active():
+                    break
+                present, details = l2_target_ring_snapshot(relink)
+                observations.append(details)
+                present_votes += int(present)
+                if sample_index + 1 < L2_RING_CONFIRM_SAMPLES:
+                    sleep(L2_RING_SAMPLE_INTERVAL_SECONDS)
+
+            if not observations:
+                continue
+            # Result detection can flip battle_active while a three-frame
+            # sample group is in progress. Discard the incomplete group before
+            # reading SBA or emitting a battle-only diagnostic.
+            if not relink.running or relink.paused or not battle_is_active():
+                continue
+
+            ring_present = present_votes >= L2_RING_PRESENT_MIN_SAMPLES
+            sba_fill = remote_sba_fill_fraction(relink)
+            delta = None if previous_sba is None else sba_fill - previous_sba
+            grew = delta is not None and delta > L2_SBA_GROWTH_EPSILON
+            released = delta is not None and delta <= -0.15
+            if grew:
+                last_sba_growth_at = now
+            if released:
+                release_protection_until = now + L2_SBA_RING_GUARDED_RELEASE_PROTECTION_SECONDS
+
+            recent_growth = (
+                last_sba_growth_at is not None
+                and now - last_sba_growth_at <= L2_SBA_RING_GUARDED_RECENT_GROWTH_SECONDS
+            )
+            protected = recent_growth or now < release_protection_until
+            if ring_present or protected:
+                missing_groups = 0
+                l2_attempts = 0
+            else:
+                missing_groups += 1
+
+            log.info(
+                "方案6索敌：锁定环=%s(%d/%d)，奥义=%.1f%%，增量=%s，增长保护=%s，释放保护=%s，缺失组=%d，L2尝试=%d",
+                "有" if ring_present else "无",
+                present_votes,
+                len(observations),
+                sba_fill * 100.0,
+                "未知" if delta is None else f"{delta * 100.0:+.1f}%",
+                "是" if recent_growth else "否",
+                "是" if now < release_protection_until else "否",
+                missing_groups,
+                l2_attempts,
+            )
+            previous_sba = sba_fill
+
+            if ring_present or protected:
+                continue
+            if missing_groups < L2_SBA_RING_GUARDED_MISSING_GROUPS:
+                continue
+            if now < next_l2_allowed:
+                continue
+
+            with AUTOMATION_INPUT_LOCK:
+                if not relink.running or relink.paused or not battle_is_active():
+                    continue
+                relink.press(L2_KEY)
+            next_l2_allowed = now + L2_SBA_RING_GUARDED_L2_COOLDOWN_SECONDS
+            missing_groups = 0
+            l2_attempts += 1
+            log.warning(
+                "方案6索敌：锁定环持续缺失且奥义无增长，发送 L2（第%d次，冷却%.0f秒）",
+                l2_attempts,
+                L2_SBA_RING_GUARDED_L2_COOLDOWN_SECONDS,
+            )
+
+            if l2_attempts < L2_SBA_RING_GUARDED_RECOVER_ATTEMPTS:
+                continue
+            l2_attempts = 0
+            turn_key = LEFT_STICK_LEFT_KEY if search_left else LEFT_STICK_RIGHT_KEY
+            camera_key = RIGHT_STICK_LEFT_KEY if search_left else RIGHT_STICK_RIGHT_KEY
+            log.warning("方案6索敌：两次低频 L2 后仍无恢复，开始折返索敌")
+            if recover_lost_target(relink, battle_is_active, turn_key, camera_key):
+                search_left = not search_left
+        except Exception:
+            log.debug("方案6索敌采样失败（已忽略）", exc_info=True)
+
+
+def ring_arc_experiment_focus_watchdog(
+    relink: Controller, battle_is_active: Callable[[], bool]
+) -> None:
+    """Use scheme-6 safeguards with scheme-7 partial lock-ring arc evidence."""
+    next_probe = 0.0
+    next_l2_allowed = 0.0
+    previous_sba: float | None = None
+    last_sba_growth_at: float | None = None
+    release_protection_until = 0.0
+    missing_groups = 0
+    l2_attempts = 0
+    search_left = True
+
+    while relink.running:
+        if relink.paused or not battle_is_active():
+            next_probe = 0.0
+            next_l2_allowed = 0.0
+            previous_sba = None
+            last_sba_growth_at = None
+            release_protection_until = 0.0
+            missing_groups = 0
+            l2_attempts = 0
+            sleep(0.5)
+            continue
+
+        now = time()
+        if now < next_probe:
+            sleep(min(0.2, next_probe - now))
+            continue
+        next_probe = now + L2_SBA_RING_GUARDED_PROBE_INTERVAL_SECONDS
+
+        try:
+            present_votes = 0
+            observations: list[dict[str, float]] = []
+            for sample_index in range(L2_RING_CONFIRM_SAMPLES):
+                if not relink.running or relink.paused or not battle_is_active():
+                    break
+                candidate, details = l2_target_ring_arc_snapshot(relink)
+                observations.append(details)
+                present_votes += int(candidate)
+                if sample_index + 1 < L2_RING_CONFIRM_SAMPLES:
+                    sleep(L2_RING_SAMPLE_INTERVAL_SECONDS)
+
+            if not observations:
+                continue
+            # The result state can begin while this multi-frame sample group
+            # is still being collected. Do not read SBA or emit a scheme-7
+            # diagnostic once battle ownership has been released.
+            if not relink.running or relink.paused or not battle_is_active():
+                continue
+
+            ring_present = present_votes >= L2_RING_PRESENT_MIN_SAMPLES
+            ring_detail = max(observations, key=lambda item: item.get("score", 0.0))
+            sba_fill = remote_sba_fill_fraction(relink)
+            delta = None if previous_sba is None else sba_fill - previous_sba
+            grew = delta is not None and delta > L2_SBA_GROWTH_EPSILON
+            released = delta is not None and delta <= -0.15
+            if grew:
+                last_sba_growth_at = now
+            if released:
+                release_protection_until = now + L2_SBA_RING_GUARDED_RELEASE_PROTECTION_SECONDS
+            recent_growth = (
+                last_sba_growth_at is not None
+                and now - last_sba_growth_at <= L2_SBA_RING_GUARDED_RECENT_GROWTH_SECONDS
+            )
+            protected = recent_growth or now < release_protection_until
+            if ring_present or protected:
+                missing_groups = 0
+                l2_attempts = 0
+            else:
+                missing_groups += 1
+
+            log.info(
+                "方案7索敌：圆弧环=%s(%d/%d，评分=%.3f，弧段=%d，连续弧=%d，细线=%.2f，内部金色=%.3f)，奥义=%.1f%%，增量=%s，增长保护=%s，释放保护=%s，缺失组=%d，L2尝试=%d",
+                "有" if ring_present else "无",
+                present_votes,
+                len(observations),
+                ring_detail.get("score", 0.0),
+                int(ring_detail.get("arc_sectors", 0.0)),
+                int(ring_detail.get("max_arc_run", 0.0)),
+                ring_detail.get("thinness", 0.0),
+                ring_detail.get("interior_gold", 0.0),
+                sba_fill * 100.0,
+                "未知" if delta is None else f"{delta * 100.0:+.1f}%",
+                "是" if recent_growth else "否",
+                "是" if now < release_protection_until else "否",
+                missing_groups,
+                l2_attempts,
+            )
+            previous_sba = sba_fill
+
+            if ring_present or protected:
+                continue
+            if missing_groups < L2_SBA_RING_GUARDED_MISSING_GROUPS:
+                continue
+            if now < next_l2_allowed:
+                continue
+
+            with AUTOMATION_INPUT_LOCK:
+                if not relink.running or relink.paused or not battle_is_active():
+                    continue
+                relink.press(L2_KEY)
+            next_l2_allowed = now + L2_SBA_RING_GUARDED_L2_COOLDOWN_SECONDS
+            missing_groups = 0
+            l2_attempts += 1
+            log.warning(
+                "方案7索敌：圆弧环持续缺失且奥义无增长，发送 L2（第%d次，冷却%.0f秒）",
+                l2_attempts,
+                L2_SBA_RING_GUARDED_L2_COOLDOWN_SECONDS,
+            )
+            if l2_attempts < L2_SBA_RING_GUARDED_RECOVER_ATTEMPTS:
+                continue
+            l2_attempts = 0
+            turn_key = LEFT_STICK_LEFT_KEY if search_left else LEFT_STICK_RIGHT_KEY
+            camera_key = RIGHT_STICK_LEFT_KEY if search_left else RIGHT_STICK_RIGHT_KEY
+            log.warning("方案7索敌：两次低频 L2 后仍无恢复，开始折返索敌")
+            if recover_lost_target(relink, battle_is_active, turn_key, camera_key):
+                search_left = not search_left
+        except Exception:
+            log.debug("方案7索敌采样失败（已忽略）", exc_info=True)
+
+
 def focus_watchdog(relink: Controller, battle_is_active: Callable[[], bool]) -> None:
     """Recover target lock when trigger skills stay bright for long enough."""
     log.info("当前索敌方案：%s", REFOCUS_MODE_LABELS.get(REFOCUS_MODE, REFOCUS_MODE))
@@ -1892,6 +2532,12 @@ def focus_watchdog(relink: Controller, battle_is_active: Callable[[], bool]) -> 
         return
     if REFOCUS_MODE == REFOCUS_MODE_L2_SBA:
         l2_sba_focus_watchdog(relink, battle_is_active)
+        return
+    if REFOCUS_MODE == REFOCUS_MODE_SBA_RING_GUARDED:
+        sba_ring_guarded_focus_watchdog(relink, battle_is_active)
+        return
+    if REFOCUS_MODE == REFOCUS_MODE_RING_ARC_EXPERIMENT:
+        ring_arc_experiment_focus_watchdog(relink, battle_is_active)
         return
     bright_since: float | None = None
     dim_since: float | None = None
@@ -1991,6 +2637,8 @@ def read_region_texts(relink: Controller, region_key: str) -> dict[str, str]:
     separate OCR item while the other stable markers keep their fast path.
     """
     global _CAPTURE_UNAVAILABLE_WARNED
+    if region_key == "结算":
+        return read_settlement_center_texts(relink)
     if region_key == "继续":
         return read_region_detected_texts(
             relink,
@@ -2099,6 +2747,53 @@ def battle_hud_layout_score(frame: Image.Image) -> float:
     return float(mask.mean())
 
 
+def log_recovery_debug(
+    relink: Controller, stage: str, *, hud_score: float | None = None,
+    texts: dict[str, str] | None = None,
+) -> None:
+    """Write bounded recovery evidence when a support run enables DEBUG."""
+    if not DEBUG_MODE:
+        return
+    try:
+        rect = relink.get_window_rect(silent=True)
+    except Exception:
+        rect = None
+    payload: dict[str, object] = {
+        "stage": stage,
+        "window_rect": rect,
+        "hud_region": BATTLE_HUD_LAYOUT_REGION,
+        "hud_score": None if hud_score is None else round(hud_score, 5),
+    }
+    try:
+        geometry = relink.recognition_geometry_state()
+        payload["recognition_geometry"] = geometry
+        metadata = getattr(relink, "_last_recognition_metadata", None)
+        if metadata:
+            payload["normalized_frame"] = metadata
+    except Exception:
+        pass
+    if texts:
+        payload["ocr"] = {
+            language: str(value)[:500]
+            for language, value in texts.items()
+            if value
+        }
+    encoded = json.dumps(payload, ensure_ascii=False)
+    log.debug("DEBUG恢复诊断 %s", encoded)
+    if DEBUG_DIAGNOSTIC_PATH is not None:
+        try:
+            with DEBUG_DIAGNOSTIC_PATH.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {"timestamp": datetime.now().isoformat(timespec="milliseconds"), **payload},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        except OSError:
+            log.debug("DEBUG诊断文件写入失败", exc_info=True)
+
+
 def battle_hud_visual_candidate(relink: Controller) -> tuple[bool, float]:
     """Cheap pixel-only probe used before recovery OCR.
 
@@ -2120,6 +2815,7 @@ def battle_hud_visual_candidate(relink: Controller) -> tuple[bool, float]:
         )
     )
     score = battle_hud_layout_score(frame)
+    log_recovery_debug(relink, "battle_hud_visual", hud_score=score)
     return score >= BATTLE_HUD_BLUE_MIN_FRACTION, score
 
 
@@ -2137,6 +2833,7 @@ def battle_hud_candidate(relink: Controller) -> bool:
         None,
     )
     if language is None:
+        log_recovery_debug(relink, "battle_hud_text_miss", texts=texts)
         return False
 
     rect = relink.get_window_rect(silent=True)
@@ -2153,6 +2850,7 @@ def battle_hud_candidate(relink: Controller) -> bool:
         )
     )
     score = battle_hud_layout_score(frame)
+    log_recovery_debug(relink, "battle_hud_layout", hud_score=score, texts=texts)
     if score < BATTLE_HUD_BLUE_MIN_FRACTION:
         log.debug(
             "OCR 命中战斗文字，但技能 HUD 结构不成立（蓝色占比 %.1f%%），忽略本帧",
@@ -2167,6 +2865,7 @@ def battle_hud_candidate(relink: Controller) -> bool:
     if not _text_matches_marker(
         timer_texts.get(language, ""), language, "battle_timer"
     ):
+        log_recovery_debug(relink, "battle_timer_miss", texts=timer_texts)
         log.debug(
             "战斗文字和技能 HUD 已命中，但右上角未识别到战斗倒计时，忽略本帧"
         )
@@ -2234,35 +2933,62 @@ def unexpected_town_recovery_signal(relink: Controller) -> str:
 
 
 def result_repeat_indicator_is_gold(relink: Controller) -> bool:
-    """Detect the language-independent gold auto-repeat indicator."""
+    """Detect gold using a local-density search inside the marked panel."""
 
-    rect = relink.get_window_rect(silent=True)
-    if rect is None:
+    try:
+        frame = relink.screenshot().convert("RGB")
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
         return False
-    left, top, width, height = rect
+    width, height = frame.size
     x0, y0, x1, y1 = RESULT_REPEAT_INDICATOR_REGION
-    frame = relink.screenshot(
-        region=(
-            left + int(width * x0),
-            top + int(height * y0),
-            max(1, int(width * (x1 - x0))),
-            max(1, int(height * (y1 - y0))),
-        )
+    sx0, sy0, sx1, sy1 = RESULT_REPEAT_INDICATOR_SEARCH_REGION
+    window_width = max(4, int(width * (x1 - x0)))
+    window_height = max(4, int(height * (y1 - y0)))
+    search_left = int(width * sx0)
+    search_top = int(height * sy0)
+    search_right = int(width * sx1)
+    search_bottom = int(height * sy1)
+    # The icon may shift slightly with client scaling and capture rounding.
+    # Scan the marked panel with the same-size local window instead of using
+    # the whole panel's much smaller average gold fraction.
+    best_fraction = 0.0
+    best_offset = (0, 0)
+    for top in range(search_top, max(search_top, search_bottom - window_height + 1), 4):
+        for left in range(search_left, max(search_left, search_right - window_width + 1), 4):
+            crop = frame.crop(
+                (left, top, left + window_width, top + window_height)
+            )
+            score = _gold_pixel_fraction(crop)
+            if score > best_fraction:
+                best_fraction = score
+                best_offset = (left, top)
+    log.debug(
+        "结算红框局部金色检测 | best_fraction=%.3f | threshold=%.3f | offset=%s | search=%s",
+        best_fraction,
+        RESULT_REPEAT_GOLD_MIN_FRACTION,
+        best_offset,
+        RESULT_REPEAT_INDICATOR_SEARCH_REGION,
     )
+    return best_fraction >= RESULT_REPEAT_GOLD_MIN_FRACTION
+
+
+def _gold_pixel_fraction(frame: Image.Image) -> float:
+    """Return the fraction of saturated gold pixels in a small RGB crop."""
     pixels = np.asarray(frame.convert("RGB"), dtype=np.float32)
     if pixels.ndim != 3 or pixels.shape[0] < 4 or pixels.shape[1] < 4:
-        return False
+        return 0.0
     red = pixels[:, :, 0]
     green = pixels[:, :, 1]
     blue = pixels[:, :, 2]
     gold = (
-        (red >= 120.0)
-        & (green >= 85.0)
-        & (red - blue >= 55.0)
-        & (green - blue >= 35.0)
-        & (red - green <= 110.0)
+        (red >= 140.0)
+        & (green >= 105.0)
+        & (blue <= 105.0)
+        & (red - blue >= 65.0)
+        & (green - blue >= 40.0)
+        & (red - green <= 115.0)
     )
-    return float(gold.mean()) >= RESULT_REPEAT_GOLD_MIN_FRACTION
+    return float(gold.mean())
 
 
 def result_repeat_indicator_is_stably_gold(relink: Controller) -> bool:
@@ -2286,6 +3012,211 @@ def result_repeat_indicator_is_stably_gold(relink: Controller) -> bool:
     except Exception:
         log.debug("金色自动重战标记二次确认失败", exc_info=True)
         return False
+
+
+def result_repeat_control_is_visible(relink: Controller) -> bool:
+    """Return whether the lower-left retry action bar is visible.
+
+    This distinguishes the preliminary BATTLE RESULT summary from the next
+    result page that actually exposes ``再挑戦する``. It is intentionally a
+    visual guard, not evidence that auto-repeat is enabled.
+    """
+    try:
+        frame = relink.screenshot().convert("RGB")
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    width, height = frame.size
+    x0, y0, x1, y1 = RESULT_REPEAT_CONTROL_REGION
+    crop = np.asarray(
+        frame.crop(
+            (
+                int(width * x0),
+                int(height * y0),
+                int(width * x1),
+                int(height * y1),
+            )
+        ),
+        dtype=np.float32,
+    )
+    if crop.ndim != 3 or crop.shape[0] < 4 or crop.shape[1] < 4:
+        return False
+    red = crop[:, :, 0]
+    green = crop[:, :, 1]
+    blue = crop[:, :, 2]
+    action_blue = (blue >= 80.0) & (blue - red >= 18.0) & (blue - green >= 8.0)
+    return float(action_blue.mean()) >= RESULT_REPEAT_CONTROL_BLUE_MIN_FRACTION
+
+
+def result_repeat_ps_button_is_visible(relink: Controller) -> bool:
+    """Detect the white circular PS5 glyph on the lower-left retry bar."""
+    try:
+        frame = relink.screenshot().convert("RGB")
+        width, height = frame.size
+        x0, y0, x1, y1 = RESULT_REPEAT_PS_BUTTON_REGION
+        crop = np.asarray(
+            frame.crop(
+                (
+                    int(width * x0),
+                    int(height * y0),
+                    int(width * x1),
+                    int(height * y1),
+                )
+            ),
+            dtype=np.float32,
+        )
+        if crop.ndim != 3 or crop.shape[0] < 4 or crop.shape[1] < 4:
+            return False
+        red, green, blue = crop[:, :, 0], crop[:, :, 1], crop[:, :, 2]
+        white = (
+            (red >= 170.0)
+            & (green >= 170.0)
+            & (blue >= 170.0)
+            & (np.maximum.reduce((red, green, blue)) - np.minimum.reduce((red, green, blue)) <= 45.0)
+        )
+        fraction = float(white.mean())
+        visible = fraction >= RESULT_REPEAT_PS_BUTTON_MIN_FRACTION
+        log.debug(
+            "日文结算 PS5 圆形按钮检测 | white_fraction=%.3f | threshold=%.3f | visible=%s",
+            fraction,
+            RESULT_REPEAT_PS_BUTTON_MIN_FRACTION,
+            visible,
+        )
+        return visible
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def result_msp_marker_is_visible(relink: Controller) -> bool:
+    """Detect the small ``獲得MSP`` reward row as a secondary page gate."""
+    try:
+        frame = relink.screenshot().convert("RGB")
+        width, height = frame.size
+        x0, y0, x1, y1 = RESULT_MSP_MARKER_REGION
+        crop = frame.crop(
+            (int(width * x0), int(height * y0), int(width * x1), int(height * y1))
+        )
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        crop = crop.resize((max(1, crop.width * 3), max(1, crop.height * 3)), resampling)
+        recognized: list[str] = []
+        for language in tuple(dict.fromkeys(relink.ui_language_candidates() or ("ja",))):
+            result = relink.ocr(crop, confidence=0.35, language=language)
+            if isinstance(result, list):
+                recognized.extend(
+                    str(item.get("text", ""))
+                    for item in result
+                    if isinstance(item, dict)
+                )
+        text = "".join(recognized).upper().replace(" ", "")
+        normalized = text.replace("５", "5").replace("Ｐ", "P")
+        has_msp = any(marker in normalized for marker in ("MSP", "M5P", "M$P"))
+        has_number = sum(char.isdigit() for char in normalized) >= RESULT_MSP_MARKER_MIN_DIGITS
+        visible = has_msp and has_number
+        log.debug(
+            "日文结算 MSP 兜底区域检测 | text=%r | visible=%s",
+            text,
+            visible,
+        )
+        return visible
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def japanese_retry_page_is_visible(relink: Controller) -> bool:
+    """Use a two-part page gate for every Japanese Square fallback.
+
+    ``獲得MSP`` is also present on the preliminary BATTLE RESULT summary, so
+    it cannot identify the retry page on its own.  The lower-left action bar
+    is the page discriminator; the PS button or MSP row only corroborates
+    that discriminator after it has been found.
+    """
+    if not result_repeat_control_is_visible(relink):
+        return False
+    return result_repeat_ps_button_is_visible(relink) or result_msp_marker_is_visible(
+        relink
+    )
+
+
+def result_continue_visual_is_visible(relink: Controller) -> bool:
+    """Detect the bright right-bottom result ``次へ`` prompt without OCR."""
+    try:
+        frame = relink.screenshot().convert("RGB")
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    width, height = frame.size
+    x0, y0, x1, y1 = RESULT_CONTINUE_VISUAL_REGION
+    crop = np.asarray(
+        frame.crop(
+            (
+                int(width * x0),
+                int(height * y0),
+                int(width * x1),
+                int(height * y1),
+            )
+        ),
+        dtype=np.float32,
+    )
+    if crop.ndim != 3 or crop.shape[0] < 4 or crop.shape[1] < 4:
+        return False
+    red, green, blue = crop[:, :, 0], crop[:, :, 1], crop[:, :, 2]
+    bright_prompt = (
+        (red >= 150.0)
+        & (green >= 150.0)
+        & (blue >= 150.0)
+        & (np.abs(red - green) <= 55.0)
+        & (np.abs(green - blue) <= 55.0)
+    )
+    cyan_prompt = (
+        (blue >= 130.0)
+        & (green >= 120.0)
+        & (blue - red >= 20.0)
+    )
+    fraction = float((bright_prompt | cyan_prompt).mean())
+    return fraction >= RESULT_CONTINUE_VISUAL_MIN_FRACTION
+
+
+def result_progress_prompt_is_visible(relink: Controller) -> bool:
+    """Recognize the language-specific form of the common result advance step.
+
+    Both clients must expose a result-progress affordance before Cross may
+    advance a completed result page.  Chinese uses the narrow ``继续`` OCR
+    marker; Japanese first uses its ``次へ`` OCR marker and may fall back to
+    the low-resolution visual prompt when that glyph is lost to compression.
+    """
+    if region_has_marker(relink, "继续", "result_continue"):
+        return True
+    return (
+        "ja" in relink.ui_language_candidates()
+        and result_continue_visual_is_visible(relink)
+    )
+
+
+def press_visual_result_continue(
+    relink: Controller, repeat_armed: bool
+) -> bool:
+    """Send Cross for a visible result prompt when OCR misses ``次へ``.
+
+    Before the gold repeat state is confirmed, a visible lower-left retry bar
+    blocks this fallback. Once repeat is armed, the same prompt is safe to
+    accept on the retry page.
+    """
+    if relink.paused or not result_continue_visual_is_visible(relink):
+        return False
+    if not repeat_armed and japanese_retry_page_is_visible(relink):
+        return False
+    serial, _ = relink.capture_frame_state()
+    if not relink.wait_for_fresh_capture(
+        serial, timeout=BATTLE_HUD_CONFIRM_INTERVAL_SECONDS + 0.35
+    ):
+        return False
+    if relink.paused or not result_continue_visual_is_visible(relink):
+        return False
+    with AUTOMATION_INPUT_LOCK:
+        if not relink.running:
+            return False
+        relink.press(CROSS_KEY)
+    log.info("日文结算右下视觉确认到次へ，发送 Cross（OCR 兜底）")
+    sleep(0.75)
+    return True
 
 
 def detect_stable_battle_hud(relink: Controller) -> bool:
@@ -2344,6 +3275,111 @@ def full_frame_texts(
         else:
             texts[language] = ""
     return texts
+
+
+def read_settlement_center_texts(relink: Controller) -> dict[str, str]:
+    """Read the central result dialog, using enhancement only as a fallback.
+
+    Small Chiaki windows blur the Japanese title into the result background.
+    The right-bottom continue crop remains readable, but the center title and
+    question need a wider crop plus contrast/sharpen passes. Keep this scoped
+    to the result-center region so no other OCR marker becomes more permissive.
+    """
+    global _CAPTURE_UNAVAILABLE_WARNED
+    try:
+        crop = relink.screenshot_text("结算").convert("RGB")
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        texts: dict[str, str] = {}
+        for language in relink.ui_language_candidates():
+            result = relink.ocr(crop, confidence=0.35, language=language)
+            best_text = "".join(
+                str(item.get("text", "")) for item in result
+            ) if isinstance(result, list) else ""
+            base_score = sum(
+                1
+                for semantic in ("settlement", "confirmation", "challenge_confirmation")
+                if _text_matches_marker(best_text, language, semantic)
+            )
+            if base_score:
+                texts[language] = best_text
+                log.debug("结算中心 OCR[%s] 命中基础路径: %r", language, best_text)
+                continue
+
+            # Low-resolution/compressed Japanese text can disappear in the
+            # original crop. Pay the extra OCR cost only after the normal
+            # recognition path fails to provide a settlement marker.
+            candidates = [
+                ImageEnhance.Contrast(crop).enhance(1.8),
+                ImageEnhance.Contrast(crop).enhance(1.8).filter(
+                    ImageFilter.UnsharpMask(radius=1, percent=180, threshold=2)
+                ),
+            ]
+            best_score = 0
+            for candidate in candidates:
+                result = relink.ocr(candidate, confidence=0.35, language=language)
+                candidate_text = "".join(
+                    str(item.get("text", "")) for item in result
+                ) if isinstance(result, list) else ""
+                score = sum(
+                    1
+                    for semantic in ("settlement", "confirmation", "challenge_confirmation")
+                    if _text_matches_marker(candidate_text, language, semantic)
+                )
+                if score > best_score or (score == best_score and len(candidate_text) > len(best_text)):
+                    best_score = score
+                    best_text = candidate_text
+            texts[language] = best_text
+            log.debug("结算中心 OCR[%s] 进入增强兜底: %r", language, best_text)
+    except RuntimeError as exc:
+        if not _CAPTURE_UNAVAILABLE_WARNED:
+            log.warning("Chiaki 画面/OCR 暂时不可用，保留当前阶段并等待窗口恢复或重建：%s", exc)
+            _CAPTURE_UNAVAILABLE_WARNED = True
+        return {}
+    except Exception:
+        if not _CAPTURE_UNAVAILABLE_WARNED:
+            log.warning(
+                "Chiaki 画面/OCR 暂时不可用，保留当前阶段并等待窗口恢复或重建",
+                exc_info=True,
+            )
+            _CAPTURE_UNAVAILABLE_WARNED = True
+        return {}
+
+    if _CAPTURE_UNAVAILABLE_WARNED:
+        log.info("Chiaki 画面已恢复，继续当前自动化阶段")
+        _CAPTURE_UNAVAILABLE_WARNED = False
+    return texts
+
+
+def town_destination_menu_has_marker(
+    relink: Controller, semantic: str = "quest_destination"
+) -> bool:
+    """Use an enlarged menu crop as a recovery-only OCR fallback."""
+    try:
+        frame = relink.screenshot().convert("RGB")
+        width, height = frame.size
+        x0, y0, x1, y1 = TOWN_DESTINATION_MENU_REGION
+        crop = frame.crop(
+            (int(width * x0), int(height * y0), int(width * x1), int(height * y1))
+        )
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        crop = crop.resize((crop.width * 2, crop.height * 2), resampling)
+        texts: dict[str, str] = {}
+        for language in relink.ui_language_candidates():
+            result = relink.ocr(crop, confidence=0.38, language=language)
+            texts[language] = (
+                "".join(str(item.get("text", "")) for item in result)
+                if isinstance(result, list)
+                else ""
+            )
+        language = _match_marker_language(relink, texts, semantic)
+        if language is not None:
+            log.info("恢复专用菜单 OCR 识别到任务中心入口（语言=%s）", language)
+            log_recovery_debug(relink, "quest_destination_menu_crop", texts=texts)
+            return True
+        log_recovery_debug(relink, "quest_destination_menu_crop_miss", texts=texts)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        log.debug("恢复专用任务菜单 OCR 失败", exc_info=True)
+    return False
 
 
 def full_frame_has_marker(
@@ -2410,6 +3446,20 @@ def town_ready_panel_present(
 ) -> bool:
     """Recognize only the language-independent right-side Box panel."""
     return town_ready_panel_has_box_icon(relink)
+
+
+def town_quest_accepted_state_present(texts: dict[str, str]) -> bool:
+    """Recognize an explicit accepted-quest state, not a menu action label."""
+    zh_text = str(texts.get("zh", ""))
+    ja_text = str(texts.get("ja", ""))
+    # ``查看已承接任务`` is a normal task-selection menu entry. It appears
+    # before a quest has been accepted and must keep the generic Cross flow.
+    chinese_accepted = (
+        "已承接任务" in zh_text and "查看已承接任务" not in zh_text
+    )
+    return chinese_accepted or any(
+        marker in ja_text for marker in ("受注しました", "準備OK")
+    )
 
 
 def town_ready_confirmation_dialog_present(relink: Controller) -> bool:
@@ -2526,6 +3576,11 @@ def wait_for_any_marker(
         for semantic in semantics:
             if full_frame_has_marker(relink, texts, semantic):
                 return semantic
+            if (
+                semantic == "quest_destination"
+                and town_destination_menu_has_marker(relink, semantic)
+            ):
+                return semantic
         sleep(poll)
     return None
 
@@ -2559,6 +3614,32 @@ def press_recovery_moon(relink: Controller, delay: float = 1.0) -> None:
     sleep(min(0.5, max(0.0, delay)))
 
 
+def abort_recovery_quest_cancel_dialog(relink: Controller) -> None:
+    """Back out of the NPC's abandon-quest confirmation during town recovery."""
+    log.info("识别到回城续战中的取消任务确认框，连续发送 3 次 Moon 返回任务卡")
+    for index in range(3):
+        if not relink.running or relink.paused:
+            return
+        press_recovery_moon(relink, 0.8)
+        log.debug("取消任务确认框：已发送第 %d/3 次 Moon", index + 1)
+
+
+def town_quest_abandon_confirmation_present(
+    relink: Controller, texts: dict[str, str]
+) -> bool:
+    """Reject the ready page's ``查看/放弃已承接任务`` menu action.
+
+    That action is visible on the normal post-Square ready page and must not
+    trigger the three-Moon abandon-dialog recovery. The broad marker remains
+    useful for OCR variants, but only after this menu-item exclusion.
+    """
+    zh_text = str(texts.get("zh", ""))
+    ja_text = str(texts.get("ja", ""))
+    if "查看/放弃已承接任务" in zh_text or "查看放弃已承接任务" in zh_text:
+        return False
+    return full_frame_has_marker(relink, texts, "quest_abandon_confirmation")
+
+
 def dismiss_town_collection_list(
     relink: Controller, texts: dict[str, str] | None = None
 ) -> bool:
@@ -2583,6 +3664,22 @@ def dismiss_town_collection_list(
 
 
 def recover_last_town_quest(
+    relink: Controller, *, destination_menu_open: bool = False
+) -> bool:
+    """Run the town task transaction without admitting asynchronous recovery."""
+    with automation_flow("town_recovery") as acquired:
+        if not acquired:
+            log.warning(
+                "主城恢复被其它自动化流程占用，保留当前画面等待其完成：%s",
+                automation_flow_name(),
+            )
+            return False
+        return _recover_last_town_quest_impl(
+            relink, destination_menu_open=destination_menu_open
+        )
+
+
+def _recover_last_town_quest_impl(
     relink: Controller, *, destination_menu_open: bool = False
 ) -> bool:
     """Re-enter the previous quest using the task-center interaction flow.
@@ -2619,11 +3716,19 @@ def recover_last_town_quest(
     # From this point the task counter owns the navigation. Do not require a
     # second OCR gate before pressing Cross: a compressed transition frame can
     # hide the quest title while Cross is still the correct action.
-    quest_deadline = time() + 60.0
+    quest_deadline = time() + TOWN_RECOVERY_NAVIGATION_TIMEOUT_SECONDS
     ready_confirmation_sent = False
     ready_confirmation_deadline: float | None = None
     ready_confirmation_action: str | None = None
+    # Once the NPC/task counter reports that the quest was accepted, a
+    # transient OCR miss on the right-side Box prompt must not fall through to
+    # the generic Cross navigation path. Keep this latch until the Box action
+    # (and subsequent final confirmation) has completed.
+    quest_accepted_waiting_for_box = False
+    next_accepted_wait_log = 0.0
     last_ready_ocr: tuple[str, str] | None = None
+    next_debug_report = 0.0
+    abandon_dialog_closed = False
     while relink.running and not relink.paused and time() < quest_deadline:
         # Battle HUD is the only completion signal. Do not stop at an
         # intermediate "accepted"/"ready" text because Cross may still be
@@ -2640,8 +3745,22 @@ def recover_last_town_quest(
             texts = full_frame_texts(relink)
         except (OSError, RuntimeError):
             texts = {}
+        if (
+            not abandon_dialog_closed
+            and town_quest_abandon_confirmation_present(relink, texts)
+        ):
+            abandon_dialog_closed = True
+            abort_recovery_quest_cancel_dialog(relink)
+            continue
         if dismiss_town_collection_list(relink, texts):
             continue
+        if town_quest_accepted_state_present(texts):
+            if not quest_accepted_waiting_for_box:
+                quest_accepted_waiting_for_box = True
+                log.info("主城恢复状态：已承接任务，进入等待右侧 Box 阶段")
+            elif DEBUG_MODE and time() >= next_accepted_wait_log:
+                next_accepted_wait_log = time() + TOWN_RECOVERY_DEBUG_REPORT_SECONDS
+                log.debug("主城恢复状态：仍在已承接任务页，等待右侧 Box")
         ready_confirmable, ready_selection, ready_texts = (
             town_ready_confirmation_is_confirmable(relink, texts)
         )
@@ -2652,7 +3771,9 @@ def recover_last_town_quest(
             if ready_confirmation_action != "cross":
                 ready_confirmation_sent = True
                 ready_confirmation_action = "cross"
-                ready_confirmation_deadline = time() + 20.0
+                ready_confirmation_deadline = (
+                    time() + TOWN_RECOVERY_BATTLE_CONFIRM_TIMEOUT_SECONDS
+                )
                 log.info("识别到开战前最终确认窗口，发送一次 Cross 真正开始任务")
                 press_recovery_cross(relink, 2.0)
             else:
@@ -2677,13 +3798,25 @@ def recover_last_town_quest(
         # precedence over the visually similar right-side quest-card Box icon.
         if town_ready_panel_present(relink):
             if not ready_confirmation_sent:
+                quest_accepted_waiting_for_box = False
                 ready_confirmation_sent = True
                 ready_confirmation_action = "square"
-                ready_confirmation_deadline = time() + 20.0
+                ready_confirmation_deadline = (
+                    time() + TOWN_RECOVERY_BATTLE_CONFIRM_TIMEOUT_SECONDS
+                )
                 log.info("识别到右侧任务卡 Box 图标，发送一次 Box/Square 开始任务")
                 press_recovery_square(relink, 2.0)
             else:
                 sleep(0.5)
+            continue
+        if quest_accepted_waiting_for_box:
+            # The task is already accepted. OCR and the Box icon can disappear
+            # briefly during a stream resize/transition; hold this state and
+            # never guess with Cross until the dedicated Box detector returns.
+            if DEBUG_MODE and time() >= next_accepted_wait_log:
+                next_accepted_wait_log = time() + TOWN_RECOVERY_DEBUG_REPORT_SECONDS
+                log.debug("主城恢复状态：已承接任务页暂未检测到 Box，保持等待")
+            sleep(0.5)
             continue
         if ready_confirmation_sent:
             # The final ready screen has already accepted exactly one Box.
@@ -2700,9 +3833,14 @@ def recover_last_town_quest(
                 final_ready, final_selection, _ = (
                     town_ready_confirmation_is_confirmable(relink)
                 )
-                if final_ready:
+                # A Box is expected to reveal this final dialog. If Cross was
+                # already sent, do not send another Cross based on a stale
+                # frame: the quest may already be loading successfully.
+                if final_ready and ready_confirmation_action == "square":
                     ready_confirmation_action = "cross"
-                    ready_confirmation_deadline = time() + 20.0
+                    ready_confirmation_deadline = (
+                        time() + TOWN_RECOVERY_BATTLE_CONFIRM_TIMEOUT_SECONDS
+                    )
                     log.warning(
                         "任务承接等待超时前专项 OCR 识别到最终确认窗口（高亮=%s），补发 Cross",
                         final_selection,
@@ -2710,10 +3848,15 @@ def recover_last_town_quest(
                     press_recovery_cross(relink, 2.0)
                     continue
                 log.error(
-                    "%s 后 20 秒仍未进入战斗，停止恢复以保留当前画面",
+                    "%s 后仍未确认战斗 HUD（等待 %.0f 秒），任务输入可能已经成功；"
+                    "保留当前画面，不重复发送按键",
                     "Box/Square" if ready_confirmation_action == "square" else "Cross",
+                    TOWN_RECOVERY_BATTLE_CONFIRM_TIMEOUT_SECONDS,
                 )
                 return False
+            if DEBUG_MODE and time() >= next_debug_report:
+                next_debug_report = time() + TOWN_RECOVERY_DEBUG_REPORT_SECONDS
+                log_recovery_debug(relink, "quest_start_wait")
             sleep(0.5)
             continue
         press_recovery_cross(relink, 1.1)
@@ -2765,8 +3908,20 @@ def classify_reconnected_screen(
         relink, texts, "town_collection_list"
     ):
         return "town_collection_list"
+    # L2 can open the quick-travel/destination list instead of exposing the
+    # quest center directly.  The first entry is already selected; pass this
+    # state to the existing town state machine so it sends Cross, walks to the
+    # NPC, and sends the mapped Pyramid/C key exactly as in the normal route.
+    if allow_town_menu and full_frame_has_marker(
+        relink, texts, "town_fast_travel"
+    ):
+        return "town_fast_travel"
     if allow_town_menu and full_frame_has_marker(
         relink, texts, "quest_destination"
+    ):
+        return "town_menu"
+    if allow_town_menu and town_destination_menu_has_marker(
+        relink, "quest_destination"
     ):
         return "town_menu"
     if full_frame_has_marker(relink, texts, "game_menu"):
@@ -2782,6 +3937,20 @@ def classify_reconnected_screen(
 
 
 def route_reconnected_screen(relink: Controller, timeout: float = 120.0) -> str | None:
+    """Route a reconnect only when no other navigation transaction owns input."""
+    with automation_flow("reconnect_route") as acquired:
+        if not acquired:
+            log.warning(
+                "断连/主城恢复延后：当前流程尚未完成：%s",
+                automation_flow_name(),
+            )
+            return None
+        return _route_reconnected_screen_impl(relink, timeout=timeout)
+
+
+def _route_reconnected_screen_impl(
+    relink: Controller, timeout: float = 120.0
+) -> str | None:
     """Wait through movies/loading and enter town recovery only after proof.
 
     Two Moon presses can leave the game in battle, a result screen, a movie,
@@ -2907,7 +4076,7 @@ def route_reconnected_screen(relink: Controller, timeout: float = 120.0) -> str 
                     next_full_probe = 0.0
                     next_town_probe = time() + 1.0
                     break
-                if state == "town_menu":
+                if state in {"town_fast_travel", "town_menu"}:
                     force_town_probe = False
                     if recover_last_town_quest(
                         relink, destination_menu_open=True
@@ -3277,12 +4446,23 @@ def stream_window_watchdog(
 
     missing_since: float | None = None
     warned = False
+    flow_deferred_logged = False
     while relink.running:
-        if relink.paused or recovery_active():
+        active_flow = automation_flow_name()
+        if relink.paused or recovery_active() or active_flow:
+            if active_flow and not flow_deferred_logged:
+                log.info(
+                    "串流窗口守护延后恢复：自动化流程进行中（%s），不插入按键",
+                    active_flow,
+                )
+                flow_deferred_logged = True
             missing_since = None
             warned = False
             sleep(STREAM_WINDOW_WATCHDOG_POLL_SECONDS)
             continue
+        if flow_deferred_logged:
+            log.info("自动化流程已结束，串流窗口守护重新确认窗口状态")
+            flow_deferred_logged = False
         try:
             valid = relink.stream_binding_is_valid()
         except Exception:
@@ -3305,13 +4485,20 @@ def stream_window_watchdog(
                     "Chiaki 串流窗口已连续 %.1f 秒消失，停止输入并启动自动重连",
                     STREAM_WINDOW_LOST_CONFIRM_SECONDS,
                 )
-                begin_recovery()
-                try:
-                    next_phase = recover_frozen_chiaki(relink)
-                except Exception:
-                    log.error("串流窗口丢失后的重连流程异常", exc_info=True)
-                    next_phase = None
-                finish_recovery(next_phase)
+                with automation_flow("stream_recovery") as acquired:
+                    if not acquired:
+                        log.info(
+                            "串流窗口恢复延后：流程刚刚取得输入所有权（%s）",
+                            automation_flow_name(),
+                        )
+                        continue
+                    begin_recovery()
+                    try:
+                        next_phase = recover_frozen_chiaki(relink)
+                    except Exception:
+                        log.error("串流窗口丢失后的重连流程异常", exc_info=True)
+                        next_phase = None
+                    finish_recovery(next_phase)
         sleep(STREAM_WINDOW_WATCHDOG_POLL_SECONDS)
 
 
@@ -3328,13 +4515,24 @@ def frozen_stream_watchdog(
     previous: np.ndarray | None = None
     activity_samples: deque[tuple[float, bool]] = deque()
     duration_warning_logged = False
+    flow_deferred_logged = False
     while relink.running:
-        if relink.paused or not battle_is_active():
+        active_flow = automation_flow_name()
+        if relink.paused or not battle_is_active() or active_flow:
+            if active_flow and not flow_deferred_logged:
+                log.info(
+                    "卡死画面守护延后恢复：自动化流程进行中（%s），不插入按键",
+                    active_flow,
+                )
+                flow_deferred_logged = True
             previous = None
             activity_samples.clear()
             duration_warning_logged = False
             sleep(1.0)
             continue
+        if flow_deferred_logged:
+            log.info("自动化流程已结束，卡死画面守护重新开始采样")
+            flow_deferred_logged = False
         try:
             current = frame_activity_signature(relink)
             now = time()
@@ -3415,13 +4613,20 @@ def frozen_stream_watchdog(
                     )
                 )
                 log.warning("Chiaki 卡死组合判据成立（%s），开始串流恢复", reason)
-                begin_recovery()
-                try:
-                    next_phase = recover_frozen_chiaki(relink)
-                except Exception:
-                    log.error("串流恢复流程异常，已停止自动输入", exc_info=True)
-                    next_phase = None
-                finish_recovery(next_phase)
+                with automation_flow("stream_recovery") as acquired:
+                    if not acquired:
+                        log.info(
+                            "卡死恢复延后：流程刚刚取得输入所有权（%s）",
+                            automation_flow_name(),
+                        )
+                        continue
+                    begin_recovery()
+                    try:
+                        next_phase = recover_frozen_chiaki(relink)
+                    except Exception:
+                        log.error("串流恢复流程异常，已停止自动输入", exc_info=True)
+                        next_phase = None
+                    finish_recovery(next_phase)
                 previous = None
                 activity_samples.clear()
                 duration_warning_logged = False
@@ -3459,8 +4664,101 @@ def press_verified_result_continue(relink: Controller) -> bool:
         if not relink.running:
             return False
         relink.press(CROSS_KEY)
-    log.info("识别到右下角‘继续’，发送一次 Cross")
+    # Japanese clients can show a second "retry this quest?" dialog after
+    # 次へ. Its labels are sometimes completely lost by OCR, while the upper
+    # yes row remains visibly highlighted. Keep a short, one-transition guard
+    # so that the next loop can accept that row without enabling the visual
+    # fallback during ordinary town HUD frames.
+    if (
+        getattr(relink, "ui_language_mode", None) == "ja"
+        or getattr(relink, "detected_ui_language", None) == "ja"
+    ):
+        try:
+            relink._japanese_result_confirmation_deadline = time() + 8.0
+        except (AttributeError, TypeError):
+            pass
+    log.info("识别到右下角‘继续’，发送第 1 次 Cross")
+    # On Japanese low-resolution streams the first result summary can remain
+    # visible for another transition. Re-check each fresh frame and provide a
+    # bounded follow-up Cross, but never press again after the retry control is
+    # visible because Square/gold verification must own that page.
+    if (
+        "ja" in relink.ui_language_candidates()
+        and not getattr(relink, "paused", False)
+    ):
+        for attempt in range(2, JAPANESE_RESULT_CONTINUE_MAX_PRESSES + 1):
+            serial, _ = relink.capture_frame_state()
+            if not relink.wait_for_fresh_capture(
+                serial, timeout=BATTLE_HUD_CONFIRM_INTERVAL_SECONDS + 0.35
+            ):
+                break
+            if relink.paused or result_repeat_control_is_visible(relink):
+                break
+            if not region_has_marker(relink, "继续", "result_continue"):
+                break
+            with AUTOMATION_INPUT_LOCK:
+                if not relink.running:
+                    break
+                relink.press(CROSS_KEY)
+            log.info("结算页仍未进入重战页，发送第 %d 次 Cross", attempt)
+            sleep(0.75)
+    else:
+        sleep(0.75)
+    return True
+
+
+def press_confirmed_repeat_continue(relink: Controller) -> bool:
+    """Advance a confirmed retry page through the shared result-progress step."""
+    if relink.paused or not relink.running:
+        return False
+    serial, _ = relink.capture_frame_state()
+    if not relink.wait_for_fresh_capture(
+        serial, timeout=BATTLE_HUD_CONFIRM_INTERVAL_SECONDS + 0.35
+    ):
+        log.debug("自动重战确认后未等到新捕获帧，暂不发送 Cross")
+        return False
+    if not result_progress_prompt_is_visible(relink):
+        log.debug("自动重战确认后尚未识别到右下推进提示，保持结算页等待")
+        return False
+    with AUTOMATION_INPUT_LOCK:
+        if relink.paused or not relink.running:
+            return False
+        relink.press(CROSS_KEY)
+    log.info("自动重战已确认开启，发送一次 Cross 进入下一轮")
     sleep(0.75)
+
+    # On the Japanese low-resolution page the first Cross can be consumed by
+    # the result transition without opening the retry confirmation. If the
+    # same verified progress prompt and confirmed retry page remain visible,
+    # send exactly one follow-up Cross. The normal highlight flow owns the
+    # subsequent yes/no selection.
+    if "ja" not in relink.ui_language_candidates():
+        return True
+    serial, _ = relink.capture_frame_state()
+    if not relink.wait_for_fresh_capture(
+        serial, timeout=BATTLE_HUD_CONFIRM_INTERVAL_SECONDS + 0.6
+    ):
+        return True
+    if relink.paused or not relink.running or detect_stable_battle_hud(relink):
+        return True
+    if japanese_settlement_highlight_dialog_active(relink):
+        return True
+    if (
+        result_progress_prompt_is_visible(relink)
+        and
+        japanese_retry_page_is_visible(relink)
+        and result_retry_state(relink) == "enabled"
+    ):
+        with AUTOMATION_INPUT_LOCK:
+            if relink.paused or not relink.running:
+                return True
+            relink.press(CROSS_KEY)
+        try:
+            relink._japanese_result_confirmation_deadline = time() + 8.0
+        except (AttributeError, TypeError):
+            pass
+        log.info("重战页首次 Cross 后尚未出现续战确认，补发第 2 次 Cross")
+        sleep(0.75)
     return True
 
 
@@ -3515,10 +4813,94 @@ def failed_repeat_has_left_result_screen(relink: Controller) -> bool:
     return unexpected_town_recovery_signal(relink) == "timer_missing_no_battle_hud"
 
 
+def read_japanese_result_retry_text(relink: Controller) -> str:
+    """Read the lower-left quarter containing the Japanese retry button.
+
+    The retry page is stable by layout, but a narrow recognition-only line can
+    return glyph variants such as 再排殺する. Use the lower-left quarter with
+    text detection so the button is isolated from the right-side 次へ prompt.
+    """
+    frame = relink.screenshot().convert("RGB")
+    width, height = frame.size
+    crop = frame.crop(
+        (
+            0,
+            int(height * 0.72),
+            int(width * 0.50),
+            height,
+        )
+    )
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    # This rare result-only OCR pass benefits from a larger recognition
+    # canvas on 540p streams. Three-times Lanczos preserves the gold outlined
+    # Japanese glyphs; sharpening was tested and made them less reliable.
+    crop = crop.resize((max(1, crop.width * 3), max(1, crop.height * 3)), resampling)
+    result = relink.ocr(crop, confidence=0.40, language="ja")
+    if not isinstance(result, list):
+        return ""
+    return "".join(str(item.get("text", "")) for item in result)
+
+
+def _japanese_retry_text_state(text: str) -> str | None:
+    """Classify noisy Japanese retry OCR after the page guard is satisfied."""
+    compact = "".join(str(text or "").split())
+    if not compact:
+        return None
+    # The cancel form is the strongest signal that Square already enabled the
+    # toggle. Include common 540P katakana/kanji substitutions.
+    if any(
+        marker in compact
+        for marker in (
+            "キャンセル",
+            "キヤンセル",
+            "ャンセル",
+            "撤销",
+            "取消",
+            "撤",
+        )
+    ):
+        return "enabled"
+    # The result-only crop is already proven to be the lower-left retry bar.
+    # Within that crop, a noisy 再 + challenge glyph is sufficient to classify
+    # the available form without requiring the entire Japanese sentence.
+    if "再" in compact and any(
+        glyph in compact for glyph in ("挑", "戦", "规", "規", "排", "製", "殺", "杀")
+    ):
+        return "available"
+    if len(compact) >= 2 and "戦" in compact:
+        return "available"
+    return None
+
+
 def result_retry_state(relink: Controller) -> str | None:
     """Return whether result-page auto-repeat is available or already enabled."""
+    # On a real Japanese Controller, the fixed gold crop is meaningful only
+    # after the lower-left retry control is visible. Before that page, the
+    # same coordinates contain result rewards and background highlights.
+    if (
+        isinstance(relink, Controller)
+        and "ja" in relink.ui_language_candidates()
+        and not (
+            japanese_retry_page_is_visible(relink)
+        )
+    ):
+        log.debug("日文总评页尚未出现左下 PS5 圆形按钮或 MSP 兜底标记，跳过重战 OCR/金色检测")
+        return None
     ocr_state: str | None = None
     texts = read_region_texts(relink, "再次")
+    if "ja" in relink.ui_language_candidates():
+        japanese_text = texts.get("ja", "")
+        if not (
+            _text_matches_marker(japanese_text, "ja", "result_retry_available")
+            or _text_matches_marker(japanese_text, "ja", "result_retry_cancel")
+        ):
+            try:
+                fallback_text = read_japanese_result_retry_text(relink)
+                if fallback_text:
+                    texts["ja"] = fallback_text
+                    log.debug("日文重战按钮切换到中央底部 OCR 兜底：%r", fallback_text)
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                log.debug("日文中央底部重战按钮 OCR 失败", exc_info=True)
     for language in relink.ui_language_candidates():
         text = texts.get(language, "")
         # Enabled text contains much of the available label in both languages,
@@ -3531,6 +4913,13 @@ def result_retry_state(relink: Controller) -> str | None:
             relink.confirm_ui_language(language, "result_retry_available")
             ocr_state = "available"
             break
+        if language == "ja":
+            fuzzy_state = _japanese_retry_text_state(text)
+            if fuzzy_state is not None:
+                relink.confirm_ui_language(language, "result_retry_fuzzy")
+                ocr_state = fuzzy_state
+                log.info("日文重战按钮宽匹配命中：%r -> %s", text, fuzzy_state)
+                break
 
     try:
         indicator_gold = result_repeat_indicator_is_stably_gold(relink)
@@ -3541,9 +4930,12 @@ def result_retry_state(relink: Controller) -> str | None:
     if ocr_state == "enabled":
         if indicator_gold:
             log.info("OCR 与金色自动重战标记均确认自动重战已开启")
-        else:
-            log.info("OCR 已确认自动重战已开启，金色图标未作为唯一依据")
-        return "enabled"
+            return "enabled"
+        # OCR can switch to キャンセル before the game finishes rendering the
+        # gold state. Never let text alone advance the result page: Square is
+        # a toggle, and a false positive here sends the player back to town.
+        log.debug("自动重战 OCR 已显示撤销/キャンセル，但金色标记尚未连续确认")
+        return None
     if ocr_state == "available":
         if indicator_gold:
             log.info("OCR 显示可开启但金色标记已存在，按补充视觉证据判定已开启")
@@ -3553,9 +4945,8 @@ def result_retry_state(relink: Controller) -> str | None:
     # The icon never identifies a result page by itself. At this point the
     # caller is already in the result phase, so it may supplement a transient
     # OCR miss by confirming the enabled state without sending a toggle.
-    if indicator_gold and texts:
-        log.info("结算页 OCR 未命中状态文字，但金色自动重战标记补充确认已开启")
-        return "enabled"
+    # Gold is only an on-page verification signal. It must never discover the
+    # retry page when OCR has not identified a retry label.
     return None
 
 
@@ -3633,9 +5024,18 @@ def settlement_confirmation_selection(relink: Controller) -> str | None:
         band = pixels[y0:y1, x0:x1]
         return float((band[:, :, 2] - (band[:, :, 0] + band[:, :, 1]) * 0.5).mean())
 
-    yes_score = blue_score(0.625)
-    no_score = blue_score(0.677)
-    delta = yes_score - no_score
+    # The Japanese 540P confirmation modal is rendered slightly lower than
+    # the old fixed ratios.  Keep the bands narrow, but sample the actual
+    # row centers used by both the 540P stream and the larger client sizes.
+    # The fallback pair is intentionally close to the original geometry so
+    # this remains scoped to the two-row result confirmation dialog.
+    candidates = (
+        (blue_score(0.625), blue_score(0.677)),
+        (blue_score(0.640), blue_score(0.700)),
+    )
+    # Select one complete row-pair, rather than mixing the best individual
+    # bands from different geometries.
+    delta = max((yes - no for yes, no in candidates), key=abs)
     if delta >= 6.0:
         return "yes"
     if delta <= -6.0:
@@ -3662,6 +5062,7 @@ def relink_battle(relink: Controller) -> None:
                 relink.release_automation_inputs()
             except Exception:
                 log.error("自动重战退出时释放输入失败", exc_info=True)
+        clear_automation_flow_state("自动重战状态机退出")
 
 
 def _relink_battle_impl(relink: Controller) -> None:
@@ -3672,8 +5073,8 @@ def _relink_battle_impl(relink: Controller) -> None:
         "battle_wait",
         "result",
         "startup_probe",
-    } else "battle_wait"
-    INITIAL_AUTOMATION_PHASE = "battle_wait"
+    } else "startup_probe"
+    INITIAL_AUTOMATION_PHASE = "startup_probe"
     battle_number = 1
     repeat_armed = False
     repeat_verification_required = False
@@ -3682,6 +5083,7 @@ def _relink_battle_impl(relink: Controller) -> None:
     # state-verified retry; this guard prevents restarting that sequence on
     # every result-loop poll.
     repeat_toggle_sent = False
+    repeat_continue_sent = False
     # Resume is a synchronization boundary: the OCR/state loop must get one
     # chance to classify a result screen before the movement worker can send
     # another forward pulse.  A dict keeps this shared value writable from the
@@ -3769,7 +5171,7 @@ def _relink_battle_impl(relink: Controller) -> None:
         return True
 
     def enter_battle() -> None:
-        nonlocal battle_active, phase, repeat_armed
+        nonlocal battle_active, phase, repeat_armed, repeat_continue_sent
         nonlocal repeat_verification_required, repeat_toggle_sent
         nonlocal repeat_activation_failed
         nonlocal town_recovery_attempts
@@ -3782,6 +5184,7 @@ def _relink_battle_impl(relink: Controller) -> None:
         reset_unrecognized_transition()
         town_recovery_attempts = 0
         repeat_armed = False
+        repeat_continue_sent = False
         repeat_verification_required = False
         repeat_toggle_sent = False
         repeat_activation_failed = False
@@ -3792,7 +5195,7 @@ def _relink_battle_impl(relink: Controller) -> None:
 
     def transition_to_result() -> None:
         """Move to result handling exactly once and finish the battle stats."""
-        nonlocal battle_active, phase, battle_number, repeat_armed
+        nonlocal battle_active, phase, battle_number, repeat_armed, repeat_continue_sent
         nonlocal repeat_verification_required, repeat_toggle_sent
         nonlocal repeat_activation_failed
         settlement_navigation["cross_sent"] = False
@@ -3803,6 +5206,7 @@ def _relink_battle_impl(relink: Controller) -> None:
             repeat_toggle_sent = False
             repeat_verification_required = False
             repeat_activation_failed = False
+            repeat_continue_sent = False
             reset_unrecognized_transition()
             with AUTOMATION_INPUT_LOCK:
                 relink.release_automation_inputs()
@@ -3815,11 +5219,13 @@ def _relink_battle_impl(relink: Controller) -> None:
             )
             battle_number += 1
             repeat_armed = False
+            repeat_continue_sent = False
         elif phase != "result":
             phase = "result"
             repeat_toggle_sent = False
             repeat_verification_required = False
             repeat_activation_failed = False
+            repeat_continue_sent = False
             with AUTOMATION_INPUT_LOCK:
                 relink.release_automation_inputs()
 
@@ -3907,8 +5313,11 @@ def _relink_battle_impl(relink: Controller) -> None:
                 phase = outcome
                 log.info("启动环境识别完成，进入阶段: %s", phase)
             else:
-                phase = "recovery_failed"
-                log.error("启动环境识别失败，停止自动输入并保留当前画面")
+                # A minimized/recreated stream has no reliable scene to
+                # classify yet. Keep probing so the capture watchdog can
+                # restore the window before town/battle/result routing.
+                log.warning("启动环境暂未确认，保持启动探测并等待新画面/窗口恢复")
+                sleep(1.0)
             continue
         if phase in ("recovery", "recovery_failed"):
             sleep(0.2)
@@ -3978,12 +5387,25 @@ def _relink_battle_impl(relink: Controller) -> None:
             enter_battle()
             continue
 
-        # Japanese confirmation text varies and can be missed by OCR. Once
-        # the client language is established, the explicit upper/lower blue
-        # highlight is the safe authority for a confirmation action.
-        if japanese_settlement_highlight_dialog_active(relink):
+        # This ten-battle modal overlays the retry page and leaves its gold
+        # control visible underneath.  It must win over every retry-state
+        # probe, otherwise the enabled control masks the required Up + Cross.
+        if japanese_retry_confirmation_present(relink):
+            handle_japanese_retry_confirmation(relink)
+            log.info("识别到日文十场再挑战确认，优先选择‘はい’后继续")
+            sleep(1.0)
+            continue
+
+        # After 次へ, the ten-battle confirmation can cover the lower-left
+        # retry control. If its Japanese title is lost by 540P OCR, the
+        # short post-Cross window plus the blue selected row is the stronger
+        # signal. Handle it before the Square/toggle probe.
+        if (
+            getattr(relink, "_japanese_result_confirmation_deadline", 0.0) > time()
+            and japanese_settlement_highlight_dialog_active(relink)
+        ):
             handle_japanese_settlement_highlight(relink)
-            log.info("识别到日文结算双选项高亮，按高亮位置处理确认")
+            log.info("日文结算 Cross 后确认窗口已按高亮处理，跳过重战页 Square 分支")
             sleep(1.0)
             continue
 
@@ -3993,12 +5415,79 @@ def _relink_battle_impl(relink: Controller) -> None:
             sleep(1.0)
             continue
 
-        center_texts = read_region_texts(relink, "结算")
+        # Low-resolution Japanese retry pages can also produce OCR that looks
+        # like the generic bottom-right Continue prompt. Probe the lower-left
+        # retry bar before any generic settlement/Cross branch, so Square is
+        # never bypassed by a false Continue match.
+        retry_state = result_retry_state(relink)
+        if (
+            "ja" in relink.ui_language_candidates()
+            and not repeat_armed
+            and not repeat_activation_failed
+            and retry_state is None
+            and japanese_retry_page_is_visible(relink)
+        ):
+            # The visual fallback owns pages whose retry text remains unreadable.
+            # After Square, keep polling the gold state instead of waiting for
+            # OCR to discover キャンセル. Otherwise a successful toggle can
+            # leave this branch stalled until the three-minute town fallback.
+            if result_repeat_indicator_is_stably_gold(relink):
+                repeat_armed = True
+                repeat_verification_required = False
+                log.info("日文低分辨率重战页红框已确认金色，进入受控 Cross 推进")
+                if not repeat_continue_sent:
+                    repeat_continue_sent = press_confirmed_repeat_continue(relink)
+                    if repeat_continue_sent:
+                        settlement_navigation["cross_sent"] = False
+                        settlement_navigation["no_to_yes_sent"] = False
+                        reset_unrecognized_transition()
+                sleep(0.5)
+                continue
+            if not repeat_toggle_sent:
+                serial, _ = relink.capture_frame_state()
+                with AUTOMATION_INPUT_LOCK:
+                    if relink.paused or not relink.running:
+                        continue
+                    relink.press(SQUARE_KEY, interval=0.3)
+                repeat_toggle_sent = True
+                repeat_verification_required = True
+                log.info(
+                    "日文低分辨率重战页已由左下视觉区域确认，未依赖文字 OCR，发送一次 Square"
+                )
+                relink.wait_for_fresh_capture(serial, timeout=1.5)
+            else:
+                log.debug("日文低分辨率重战页已发送 Square，继续等待金色状态")
+            sleep(0.5)
+            continue
+
+        japanese_retry_precheck = None
+        if "ja" in relink.ui_language_candidates():
+            try:
+                japanese_retry_precheck = result_retry_state(relink)
+                if japanese_retry_precheck in {"available", "enabled"}:
+                    log.debug(
+                        "日文结算预检已命中自动重战状态：%s，跳过通用结算确认分支",
+                        japanese_retry_precheck,
+                    )
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                log.debug("日文结算自动重战预检失败", exc_info=True)
+        center_texts = (
+            {}
+            if japanese_retry_precheck in {"available", "enabled"}
+            else read_region_texts(relink, "结算")
+        )
         challenge_language = _match_marker_language(
             relink, center_texts, "challenge_confirmation"
         )
         if challenge_language:
             if challenge_language == "ja":
+                if _text_matches_marker(
+                    center_texts.get("ja", ""), "ja", "challenge_confirmation_retry"
+                ):
+                    handle_japanese_retry_confirmation(relink)
+                    log.info("识别到日文再挑戦確認界面，按上后确认‘はい’")
+                    sleep(1.0)
+                    continue
                 # Japanese labels vary (はい/いいえ, 決定/キャンセル, etc.).
                 # The blue highlight position is language-independent, so use
                 # the same fresh-frame no -> yes verification as the normal
@@ -4041,10 +5530,13 @@ def _relink_battle_impl(relink: Controller) -> None:
                     # may already have returned to town after the failed
                     # toggle, so the normal no-HUD/no-timer recovery probe
                     # must be allowed to run.
-                    repeat_activation_failed = True
-                    repeat_verification_required = False
+                    # Do not advance this Japanese result page without the
+                    # required gold confirmation. Keep polling the visible
+                    # control instead of silently falling through to Cross.
+                    repeat_activation_failed = False
+                    repeat_verification_required = True
                     log.error(
-                        "自动重战开关确认失败，解除结算阻塞并继续探测结算/主城状态"
+                        "自动重战开关未确认金色状态，保持结算页并继续等待"
                     )
             else:
                 log.debug("本页自动重战开关已完成受控尝试，不再重启切换序列")
@@ -4059,12 +5551,77 @@ def _relink_battle_impl(relink: Controller) -> None:
                 log.info("检测到自动重战已处于开启状态")
             repeat_armed = True
             repeat_verification_required = False
+            if "ja" in relink.ui_language_candidates() and not repeat_continue_sent:
+                repeat_continue_sent = press_confirmed_repeat_continue(relink)
+                if repeat_continue_sent:
+                    settlement_navigation["cross_sent"] = False
+                    settlement_navigation["no_to_yes_sent"] = False
+                    reset_unrecognized_transition()
+                    continue
 
         if repeat_verification_required and not repeat_armed and not repeat_activation_failed:
             # This page has already exposed its auto-repeat control. Do not let
             # a transient unreadable frame advance to town before activation is
-            # positively verified.
+            # positively verified.  It must still join the long no-HUD watchdog:
+            # if the game has already returned to town underneath a stale
+            # result frame, resume the normal state search instead of waiting
+            # in this branch forever.
+            if recover_after_unrecognized_transition(
+                "结算自动重战状态确认长期无进展，巡检战斗/结算/主城状态"
+            ):
+                continue
             sleep(0.5)
+            continue
+
+        # On Japanese result pages, never let the bottom-right 次へ path skip
+        # the lower-left 再挑戦する control. If this narrow OCR is transiently
+        # unreadable, stay on the page and retry rather than silently falling
+        # back to the three-minute town recovery route.
+        if (
+            "ja" in relink.ui_language_candidates()
+            and not repeat_armed
+            and not repeat_activation_failed
+            and retry_state is None
+            and japanese_retry_page_is_visible(relink)
+        ):
+            if not repeat_toggle_sent:
+                serial, _ = relink.capture_frame_state()
+                with AUTOMATION_INPUT_LOCK:
+                    if relink.paused or not relink.running:
+                        continue
+                    relink.press(SQUARE_KEY, interval=0.3)
+                repeat_toggle_sent = True
+                repeat_verification_required = True
+                log.info(
+                    "日文低分辨率重战页已由左下视觉区域确认，未依赖文字 OCR，发送一次 Square"
+                )
+                relink.wait_for_fresh_capture(serial, timeout=1.5)
+            else:
+                log.debug("日文低分辨率重战页已发送 Square，继续等待金色状态")
+            now = time()
+            last_notice = float(
+                getattr(relink, "_japanese_retry_wait_notice_at", 0.0) or 0.0
+            )
+            if now - last_notice >= 5.0:
+                log.warning(
+                    "日文结算页尚未识别左下自动重战状态，暂不发送 Cross，继续检测 再挑戦する/キャンセル"
+                )
+                setattr(relink, "_japanese_retry_wait_notice_at", now)
+            if recover_after_unrecognized_transition(
+                "日文结算重战控件长期无进展，巡检战斗/结算/主城状态"
+            ):
+                continue
+            sleep(0.5)
+            continue
+
+        # Result phase: if Japanese OCR misses 次へ, use the visual prompt.
+        # The helper blocks this path on the retry page until gold is armed.
+        if "ja" in relink.ui_language_candidates() and press_visual_result_continue(
+            relink, repeat_armed
+        ):
+            settlement_navigation["cross_sent"] = False
+            settlement_navigation["no_to_yes_sent"] = False
+            reset_unrecognized_transition()
             continue
 
         # Result phase: Cross is permitted only after two consecutive OCR
@@ -4119,6 +5676,7 @@ def relink_battle_silent(relink: Controller):
                 relink.release_automation_inputs()
             except Exception:
                 log.error("静默自动重战退出时释放输入失败", exc_info=True)
+        clear_automation_flow_state("静默自动重战状态机退出")
 
 
 def _relink_battle_silent_impl(relink: Controller):
@@ -4128,11 +5686,12 @@ def _relink_battle_silent_impl(relink: Controller):
         "battle_wait",
         "result",
         "startup_probe",
-    } else "battle_wait"
-    INITIAL_AUTOMATION_PHASE = "battle_wait"
+    } else "startup_probe"
+    INITIAL_AUTOMATION_PHASE = "startup_probe"
     repeat_armed = False
     repeat_verification_required = False
     repeat_toggle_sent = False
+    repeat_continue_sent = False
     repeat_activation_failed = False
     settlement_navigation = {"no_to_yes_sent": False}
     recovery_state = {"active": False}
@@ -4226,8 +5785,8 @@ def _relink_battle_silent_impl(relink: Controller):
                 phase = outcome
                 log.info("静默模式启动环境识别完成，进入阶段: %s", phase)
             else:
-                relink.running = False
-                log.error("静默模式启动环境识别失败，停止自动输入并保留当前画面")
+                log.warning("静默模式启动环境暂未确认，保持启动探测并等待新画面/窗口恢复")
+                sleep(1.0)
             continue
         if phase == "battle_wait":
             if detect_stable_battle_hud(relink):
@@ -4277,11 +5836,21 @@ def _relink_battle_silent_impl(relink: Controller):
             sleep(1.0)
             continue
 
-        # This is the silent loop's result-only branch. Japanese prompt text
-        # can vary, while the blue upper/lower selection is stable.
-        if japanese_settlement_highlight_dialog_active(relink):
+        # The Japanese ten-battle confirmation is an overlay above the retry
+        # controls.  Detect it before the enabled-state probe so the retained
+        # gold icon cannot hide the required Up + Cross action.
+        if japanese_retry_confirmation_present(relink):
+            handle_japanese_retry_confirmation(relink)
+            log.info("静默模式识别到日文十场再挑战确认，优先选择‘はい’后继续")
+            sleep(1.0)
+            continue
+
+        if (
+            getattr(relink, "_japanese_result_confirmation_deadline", 0.0) > time()
+            and japanese_settlement_highlight_dialog_active(relink)
+        ):
             handle_japanese_settlement_highlight(relink)
-            log.info("静默模式识别到日文结算双选项高亮，按高亮位置处理确认")
+            log.info("静默模式日文结算 Cross 后确认窗口已按高亮处理，跳过重战页 Square 分支")
             sleep(1.0)
             continue
 
@@ -4291,12 +5860,73 @@ def _relink_battle_silent_impl(relink: Controller):
             sleep(1.0)
             continue
 
-        center_texts = read_region_texts(relink, "结算")
+        # In silent mode, the visual retry bar must win over generic Continue
+        # OCR. A false Continue match must never consume the page before Square.
+        retry_state = result_retry_state(relink)
+        if (
+            "ja" in relink.ui_language_candidates()
+            and not repeat_armed
+            and not repeat_activation_failed
+            and retry_state is None
+            and japanese_retry_page_is_visible(relink)
+        ):
+            if result_repeat_indicator_is_stably_gold(relink):
+                repeat_armed = True
+                repeat_verification_required = False
+                log.info("静默模式日文低分辨率重战页红框已确认金色，进入受控 Cross 推进")
+                if not repeat_continue_sent:
+                    repeat_continue_sent = press_confirmed_repeat_continue(relink)
+                    if repeat_continue_sent:
+                        settlement_navigation["cross_sent"] = False
+                        settlement_navigation["no_to_yes_sent"] = False
+                        unrecognized_since = None
+                        timer_missing_since = None
+                sleep(0.5)
+                continue
+            if not repeat_toggle_sent:
+                serial, _ = relink.capture_frame_state()
+                with AUTOMATION_INPUT_LOCK:
+                    if relink.paused or not relink.running:
+                        continue
+                    relink.press(SQUARE_KEY, interval=0.3)
+                repeat_toggle_sent = True
+                repeat_verification_required = True
+                log.info(
+                    "静默模式日文低分辨率重战页已由左下视觉区域确认，未依赖文字 OCR，发送一次 Square"
+                )
+                relink.wait_for_fresh_capture(serial, timeout=1.5)
+            else:
+                log.debug("静默模式日文低分辨率重战页已发送 Square，继续等待金色状态")
+            sleep(0.5)
+            continue
+
+        japanese_retry_precheck = None
+        if "ja" in relink.ui_language_candidates():
+            try:
+                japanese_retry_precheck = result_retry_state(relink)
+                if japanese_retry_precheck in {"available", "enabled"}:
+                    log.debug(
+                        "静默模式日文结算预检已命中自动重战状态：%s，跳过通用结算确认分支",
+                        japanese_retry_precheck,
+                    )
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                log.debug("静默模式日文结算自动重战预检失败", exc_info=True)
+        center_texts = (
+            {}
+            if japanese_retry_precheck in {"available", "enabled"}
+            else read_region_texts(relink, "结算")
+        )
         challenge_language = _match_marker_language(
             relink, center_texts, "challenge_confirmation"
         )
         if challenge_language:
             if challenge_language == "ja":
+                if _text_matches_marker(
+                    center_texts.get("ja", ""), "ja", "challenge_confirmation_retry"
+                ):
+                    handle_japanese_retry_confirmation(relink)
+                    sleep(1.0)
+                    continue
                 handle_settlement_confirmation(relink, settlement_navigation)
             else:
                 settlement_navigation["no_to_yes_sent"] = False
@@ -4324,10 +5954,10 @@ def _relink_battle_silent_impl(relink: Controller):
                     repeat_armed = True
                     repeat_verification_required = False
                 else:
-                    repeat_activation_failed = True
-                    repeat_verification_required = False
+                    repeat_activation_failed = False
+                    repeat_verification_required = True
                     log.error(
-                        "静默模式自动重战开关确认失败，解除结算阻塞并继续探测结算/主城状态"
+                        "静默模式自动重战开关未确认金色状态，保持结算页并继续等待"
                     )
             if not repeat_armed and not repeat_activation_failed:
                 sleep(0.5)
@@ -4335,11 +5965,77 @@ def _relink_battle_silent_impl(relink: Controller):
         if retry_state == "enabled":
             repeat_armed = True
             repeat_verification_required = False
+            if "ja" in relink.ui_language_candidates() and not repeat_continue_sent:
+                repeat_continue_sent = press_confirmed_repeat_continue(relink)
+                if repeat_continue_sent:
+                    settlement_navigation["cross_sent"] = False
+                    settlement_navigation["no_to_yes_sent"] = False
+                    unrecognized_since = None
+                    timer_missing_since = None
+                    continue
 
         if repeat_verification_required and not repeat_armed and not repeat_activation_failed:
+            if recover_after_unrecognized_transition(
+                "静默模式结算自动重战状态确认长期无进展，巡检战斗/结算/主城状态"
+            ):
+                continue
             sleep(0.5)
             continue
 
+        if (
+            "ja" in relink.ui_language_candidates()
+            and not repeat_armed
+            and not repeat_activation_failed
+            and retry_state is None
+            and japanese_retry_page_is_visible(relink)
+        ):
+            if not repeat_toggle_sent:
+                serial, _ = relink.capture_frame_state()
+                with AUTOMATION_INPUT_LOCK:
+                    if relink.paused or not relink.running:
+                        continue
+                    relink.press(SQUARE_KEY, interval=0.3)
+                repeat_toggle_sent = True
+                repeat_verification_required = True
+                log.info(
+                    "静默模式日文低分辨率重战页已由左下视觉区域确认，未依赖文字 OCR，发送一次 Square"
+                )
+                relink.wait_for_fresh_capture(serial, timeout=1.5)
+            else:
+                log.debug("静默模式日文低分辨率重战页已发送 Square，继续等待金色状态")
+            now = time()
+            last_notice = float(
+                getattr(relink, "_japanese_retry_wait_notice_at", 0.0) or 0.0
+            )
+            if now - last_notice >= 5.0:
+                log.warning(
+                    "静默模式日文结算页尚未识别左下自动重战状态，暂不发送 Cross，继续检测 再挑戦する/キャンセル"
+                )
+                setattr(relink, "_japanese_retry_wait_notice_at", now)
+            if recover_after_unrecognized_transition(
+                "静默模式日文结算重战控件长期无进展，巡检战斗/结算/主城状态"
+            ):
+                continue
+            sleep(0.5)
+            continue
+
+        # Keep the language-independent blue-highlight fallback after the
+        # repeat-control probe. The centered Japanese 再挑戦する button is
+        # blue as well and must not advance the page before Square is checked.
+        if japanese_settlement_highlight_dialog_active(relink):
+            handle_japanese_settlement_highlight(relink)
+            log.info("静默模式识别到日文结算双选项高亮，按高亮位置处理确认")
+            sleep(1.0)
+            continue
+
+        if "ja" in relink.ui_language_candidates() and press_visual_result_continue(
+            relink, repeat_armed
+        ):
+            settlement_navigation["cross_sent"] = False
+            settlement_navigation["no_to_yes_sent"] = False
+            unrecognized_since = None
+            timer_missing_since = None
+            continue
         if press_verified_result_continue(relink):
             settlement_navigation["cross_sent"] = False
             settlement_navigation["no_to_yes_sent"] = False
@@ -4593,27 +6289,111 @@ def _load_ability_config(path: Path | None) -> dict[str, object]:
     return defaults
 
 
+def _ability_language_marker_score(items: list[dict[str, object]], language: str) -> int:
+    """Score language-exclusive ability-screen labels in one OCR result."""
+
+    text = "".join(str(item.get("text", "")) for item in items)
+    return sum(marker in text for marker in ABILITY_LANGUAGE_MARKERS.get(language, ()))
+
+
 def _read_ability_frame(relink: Controller) -> tuple[Image.Image, list[dict[str, object]]]:
-    """Capture the overlay and select the language OCR with most useful rows."""
+    """Capture the ability screen and lock its OCR language once it is proven.
+
+    Auto mode needs a Chinese/Japanese probe only until an exclusive ability
+    label is observed.  Keeping both full-frame OCR passes on every stable
+    screen roughly doubles a normal 1080p reroll cycle, while lock-on remains
+    safe because generic labels such as ``上限突破`` cannot establish it.
+    """
 
     frame = relink.screenshot_text("能力提升")
     best_items: list[dict[str, object]] = []
-    best_score = -1
-    for language in relink.ui_language_candidates():
+    best_score = (-1, -1, -1, -1)
+
+    def score_items(items: list[dict[str, object]], pass_index: int) -> tuple[int, int, int, int]:
+        canonical_count = sum(
+            normalize_ability_name(str(item.get("text", ""))) is not None
+            for item in items
+        )
+        marker_count = sum(
+            any(
+                marker in str(item.get("text", ""))
+                for marker in (
+                    *ABILITY_RESULT_MARKERS,
+                    *ABILITY_SUCCESS_MARKERS,
+                    *ABILITY_CONFIRM_MARKERS,
+                    *ABILITY_CURRENT_EFFECT_MARKERS,
+                )
+            )
+            for item in items
+        )
+        return (canonical_count, marker_count, min(len(items), 20), -pass_index)
+
+    language_results: list[tuple[str, list[dict[str, object]]]] = []
+    languages = relink.ui_language_candidates()
+    for language in languages:
         result = relink.ocr(frame, confidence=0.40, language=language)
         items = result if isinstance(result, list) else []
-        score = sum(
-            1
-            for item in items
-            if normalize_ability_name(str(item.get("text", ""))) is not None
-            or any(
-                marker in str(item.get("text", ""))
-                for marker in (*ABILITY_RESULT_MARKERS, *ABILITY_SUCCESS_MARKERS)
-            )
-        )
+        language_results.append((language, items))
+        score = score_items(items, 1)
         if score > best_score:
             best_score = score
             best_items = items
+
+    # This worker is independent from the normal rebattle process, so it must
+    # establish its own automatic language choice.  On explicit language
+    # settings ``ui_language_candidates`` already contains only one model.
+    if getattr(relink, "detected_ui_language", None) is None:
+        language_evidence = [
+            (_ability_language_marker_score(items, language), language)
+            for language, items in language_results
+        ]
+        language_evidence.sort(reverse=True)
+        if language_evidence and language_evidence[0][0] > 0:
+            evidence, language = language_evidence[0]
+            relink.confirm_ui_language(language, f"ability_marker:{evidence}")
+
+    # Four rows are enough for a normal offer/result page. A page marker plus
+    # two rows is enough while a confirmation/success page is animating in.
+    # The execute confirmation has two independent fixed labels even before
+    # its rows finish fading in; those labels are sufficient to avoid paying
+    # for enhanced OCR, while the later stage classifier still refuses input
+    # until the required rows are actually present.
+    base_is_sufficient = best_score[0] >= 4 or (
+        best_score[0] >= 2 and best_score[1] >= 1
+    ) or best_score[1] >= 2
+    fallback_passes = 0
+    if not base_is_sufficient:
+        variants = (
+            ImageEnhance.Contrast(frame).enhance(1.35),
+            ImageEnhance.Sharpness(
+                ImageEnhance.Contrast(frame).enhance(1.15)
+            ).enhance(1.8),
+        )
+        # Once language is locked this stays on the single proven model.  Do
+        # not reopen the other language merely because an animation frame has
+        # fewer visible rows than usual.
+        fallback_languages = relink.ui_language_candidates()
+        for language in fallback_languages:
+            for pass_index, candidate_frame in enumerate(variants, start=2):
+                result = relink.ocr(candidate_frame, confidence=0.40, language=language)
+                items = result if isinstance(result, list) else []
+                fallback_passes += 1
+                score = score_items(items, pass_index)
+                if score > best_score:
+                    best_score = score
+                    best_items = items
+        log.debug("能力提升基础 OCR 未充分命中，已启用增强兜底")
+    else:
+        log.debug("能力提升基础 OCR 已充分命中，跳过增强通道")
+    log.debug(
+        "能力提升 OCR 选择：语言=%s，基础通道=%d，增强通道=%d，词条数=%d，页面标记=%d，总文本=%d",
+        "/".join(languages),
+        len(language_results),
+        fallback_passes,
+        best_score[0],
+        best_score[1],
+        best_score[2],
+    )
     return frame, best_items
 
 
@@ -4825,6 +6605,10 @@ def handle_japanese_settlement_highlight(relink: Controller) -> str:
                 return "waiting"
             if relink.press(CROSS_KEY) is False:
                 return "waiting"
+            try:
+                relink._japanese_result_confirmation_deadline = 0.0
+            except (AttributeError, TypeError):
+                pass
         log.info("日文结算上方确定项已高亮，直接发送一次 Cross")
         return "confirmed"
     if selection == "no":
@@ -4838,6 +6622,102 @@ def handle_japanese_settlement_highlight(relink: Controller) -> str:
     return "waiting"
 
 
+def handle_japanese_retry_confirmation(relink: Controller) -> str:
+    """Move Japanese ``再挑戦確認`` from いいえ to はい, then Cross."""
+    serial, _ = relink.capture_frame_state()
+    with AUTOMATION_INPUT_LOCK:
+        if not relink.running:
+            return "waiting"
+        if relink.press(D_PAD_UP_KEY) is False:
+            return "waiting"
+    if not relink.wait_for_fresh_capture(
+        serial, timeout=BATTLE_HUD_CONFIRM_INTERVAL_SECONDS + 0.35
+    ):
+        log.warning("日文再挑戦確認上移后未等到新捕获帧，暂不发送 Cross")
+        return "waiting"
+    if settlement_confirmation_selection(relink) != "yes":
+        log.warning("日文再挑戦确认上移后未确认‘はい’高亮，暂不发送 Cross")
+        return "waiting"
+    with AUTOMATION_INPUT_LOCK:
+        if not relink.running or relink.press(CROSS_KEY) is False:
+            return "waiting"
+    log.info("识别到日文再挑戦確認，已上移到‘はい’并发送一次 Cross")
+    return "confirmed"
+
+
+def read_japanese_retry_confirmation_title(relink: Controller) -> str:
+    """Read only the centered Japanese retry-confirmation title.
+
+    The full result-center OCR is intentionally broad so it can also process
+    ordinary result prompts. This modal has a stable, highly legible title;
+    a dedicated crop avoids losing that title to reward text, glow effects,
+    or the lower retry control on 540P streams.
+    """
+    frame = relink.screenshot().convert("RGB")
+    width, height = frame.size
+    crop = frame.crop(
+        (
+            int(width * 0.32),
+            int(height * 0.28),
+            int(width * 0.68),
+            int(height * 0.47),
+        )
+    )
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    crop = crop.resize((max(1, crop.width * 2), max(1, crop.height * 2)), resampling)
+    result = relink.ocr(crop, confidence=0.40, language="ja")
+    if not isinstance(result, list):
+        return ""
+    return "".join(str(item.get("text", "")) for item in result)
+
+
+def japanese_retry_confirmation_present(
+    relink: Controller, texts: dict[str, str] | None = None
+) -> bool:
+    """Recognize the ten-battle Japanese retry confirmation before page controls.
+
+    The modal preserves much of the enabled auto-repeat page underneath it.
+    Therefore this must run before probing the lower-left retry toggle: the
+    underlying ``キャンセル`` and gold icon are not evidence that it is safe
+    to advance.  A dedicated center crop keeps the tolerant low-resolution
+    fallback scoped to this one result confirmation dialog.
+    """
+    # This exact title is the highest-confidence signal for the modal shown
+    # after the result page. It must precede every Square/retry-control probe.
+    if "ja" in relink.ui_language_candidates():
+        try:
+            title = read_japanese_retry_confirmation_title(relink)
+            if _text_matches_marker(title, "ja", "challenge_confirmation_retry"):
+                relink.confirm_ui_language("ja", "retry_confirmation_title")
+                log.info("日文再挑戦確認标题专用 OCR 命中：%r", title)
+                return True
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            log.debug("日文再挑戦確認标题专用 OCR 暂不可用", exc_info=True)
+
+    if texts is None:
+        try:
+            texts = read_settlement_center_texts(relink)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+    text = str(texts.get("ja", ""))
+    if _text_matches_marker(text, "ja", "challenge_confirmation_retry"):
+        relink.confirm_ui_language("ja", "retry_confirmation")
+        return True
+    compact = "".join(text.split())
+    # 540P OCR can lose the final characters of 再挑戦確認, but the modal title
+    # still keeps the retry and confirmation stems.  Do not accept a lone 再戦
+    # here: regular result controls may contain it behind the modal.
+    if (
+        "再" in compact
+        and any(glyph in compact for glyph in ("挑", "規", "排", "戦"))
+        and "確" in compact
+    ):
+        relink.confirm_ui_language("ja", "retry_confirmation_fuzzy")
+        log.info("日文再挑戦確認中心 OCR 宽匹配命中：%r", text)
+        return True
+    return False
+
+
 def japanese_settlement_highlight_dialog_active(relink: Controller) -> bool:
     """Return whether a Japanese result dialog has a usable yes/no highlight.
 
@@ -4849,6 +6729,37 @@ def japanese_settlement_highlight_dialog_active(relink: Controller) -> bool:
     while language auto-detection is unresolved, because a Chinese result
     dialog can share the same geometry.
     """
+    try:
+        center_texts = read_region_texts(relink, "结算")
+        japanese_text = center_texts.get("ja", "")
+        settlement_dialog = (
+            _text_matches_marker(japanese_text, "ja", "settlement")
+            and _text_matches_marker(japanese_text, "ja", "confirmation")
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+    pending_deadline = float(
+        getattr(relink, "_japanese_result_confirmation_deadline", 0.0) or 0.0
+    )
+    pending_confirmation = pending_deadline > time()
+
+    # The centered Japanese ``再挑戦する`` button is also blue. It must be
+    # classified before the generic two-row highlight fallback, otherwise the
+    # fallback sends Cross and the result loop never reaches Box/repeat-state
+    # verification. The caller will process this page through result_retry_state.
+    try:
+        retry_text = read_japanese_result_retry_text(relink)
+        if not pending_confirmation and (
+            _text_matches_marker(retry_text, "ja", "result_retry_available") or _text_matches_marker(
+            retry_text, "ja", "result_retry_cancel"
+            )
+        ):
+            log.debug("日文高亮兜底跳过：当前是中央底部再挑戦按钮，应先检测自动重战状态")
+            return False
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        pass
+
     configured_language = getattr(relink, "ui_language_mode", None)
     detected_language = getattr(relink, "detected_ui_language", None)
     if configured_language != "ja" and detected_language != "ja":
@@ -4856,17 +6767,49 @@ def japanese_settlement_highlight_dialog_active(relink: Controller) -> bool:
         # of this dialog. Establish Japanese context from the central result
         # crop, then let the blue selection bar decide the action. The exact
         # はい/いいえ OCR is intentionally not required here.
-        try:
-            center_texts = read_region_texts(relink, "结算")
-            japanese_text = center_texts.get("ja", "")
-            if not (
-                _text_matches_marker(japanese_text, "ja", "settlement")
-                and _text_matches_marker(japanese_text, "ja", "confirmation")
-            ):
-                return False
-            relink.confirm_ui_language("ja", "settlement_confirmation")
-        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        if not settlement_dialog:
             return False
+        relink.confirm_ui_language("ja", "settlement_confirmation")
+    # ``再挑戦確認`` has its own initial focus rule: Japanese clients open
+    # this dialog on いいえ and must move up before Cross. Check its title
+    # before the generic blue-bar fallback, otherwise a broad glow can be
+    # mistaken for はい and bypass the required Up action.
+    try:
+        if _text_matches_marker(
+            japanese_text, "ja", "challenge_confirmation_retry"
+        ):
+            log.debug("日文通用高亮兜底跳过：当前是再挑戦確認专用页面")
+            return False
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    # A blue horizontal strip also exists in the town HUD.  Japanese OCR can
+    # miss the dialog labels entirely on a small/compressed client window, but
+    # the visual fallback must still be anchored to an independently detected
+    # result page; otherwise a stale result phase can repeatedly send Up in
+    # town, exactly as seen after an interrupted rematch.
+    try:
+        result_marker = detect_stable_result_ui(relink)
+        # A center-dialog match remains a result-page anchor after the
+        # bottom-right prompt has already disappeared.
+        if result_marker is None and not pending_confirmation and not settlement_dialog:
+            log.debug("日文高亮兜底跳过：当前画面没有结算页、中央确认框或续战过渡证据")
+            return False
+        if pending_confirmation:
+            log.debug("日文续战 Cross 后进入确认过渡窗口，允许检查默认‘是’高亮")
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    # The normal Japanese result page also has a blue element near the lower
+    # part of the frame. Do not let that visual fallback steal the ordinary
+    # bottom-right ``次へ`` prompt shown in the supplied screenshot. The
+    # verified result-continue path will send Cross after two fresh OCR hits.
+    try:
+        if not pending_confirmation and region_has_marker(relink, "继续", "result_continue"):
+            log.debug("日文高亮兜底跳过：当前已识别右下角次へ继续提示")
+            return False
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        # Lightweight test doubles and a transient capture failure should not
+        # disable the established visual fallback.
+        pass
     return settlement_confirmation_selection(relink) is not None
 
 
@@ -5030,7 +6973,15 @@ def _wait_for_ability_stage(
     timeout_seconds: float,
     expected_stage: str | set[str] | tuple[str, ...] | None = None,
 ) -> tuple[str, Image.Image, list[dict[str, object]]] | None:
-    """Wait for two consistent OCR samples of an ability screen stage."""
+    """Wait for a structurally complete ability stage.
+
+    Ability reroll owns this state machine.  It must not run normal rebattle
+    settlement probes here: those probes make unrelated OCR calls and can
+    inject combat inputs into a protected reroll flow.  Only the final
+    overwrite result is read twice because its rows drive the keep/reroll
+    decision; the other stages have strict non-destructive classifiers and
+    return from their first complete frame.
+    """
 
     expected = None
     if expected_stage is not None:
@@ -5043,7 +6994,10 @@ def _wait_for_ability_stage(
         except (OSError, RuntimeError):
             sleep(0.5)
             continue
+
         if stage is not None and (expected is None or stage in expected):
+            if stage not in ABILITY_STAGE_DOUBLE_CHECK:
+                return stage, frame, items
             sleep(0.65)
             try:
                 second_frame, second_items = _read_ability_frame(relink)
@@ -5198,6 +7152,21 @@ def _cancel_ability_result(relink: Controller) -> None:
 
 def ability_reroll_loop(relink: Controller, config: dict[str, object], journal: AbilityJournal) -> None:
     """Run one independent ability reroll session until a good roll is found."""
+    with automation_flow("ability_reroll") as acquired:
+        if not acquired:
+            log.error(
+                "能力提升重抽未启动：其它自动化流程仍占用输入：%s",
+                automation_flow_name(),
+            )
+            relink.show_toast("能力提升重抽", "其它自动化流程尚未退出，未发送任何按键")
+            return
+        _ability_reroll_loop_impl(relink, config, journal)
+
+
+def _ability_reroll_loop_impl(
+    relink: Controller, config: dict[str, object], journal: AbilityJournal
+) -> None:
+    """Implementation of the protected independent ability reroll session."""
 
     total_enabled = bool(config.get("total_enabled", True))
     total_min = int(config.get("total_min", 36))
@@ -5718,6 +7687,7 @@ def run_ability_reroll(args) -> int:
         ABILITY_RELINK_DICT,
         background=args.background,
         ui_language=args.ui_language,
+        recognition_profile=args.recognition_profile,
     )
     relink.set_battle_stop_key("f2")
     relink.activate_automation("能力提升重抽")
@@ -5725,6 +7695,7 @@ def run_ability_reroll(args) -> int:
         ability_reroll_loop(relink, config, journal)
     finally:
         _clear_ability_reroll_state(relink, {})
+        clear_automation_flow_state("能力提升重抽退出")
         relink.stop()
     return 0
 
@@ -5791,6 +7762,11 @@ def parse_args():
         action="store_true",
         help="检查打包后的后台截图与虚拟手柄组件，然后退出",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="开启恢复诊断日志：记录配置、窗口尺寸、HUD/OCR 判定，不改变自动按键逻辑",
+    )
     parser.add_argument("--window-title", default=CHIAKI_WINDOW_TITLE, help="Chiaki 串流窗口标题")
     parser.add_argument(
         "--launcher-pid",
@@ -5803,6 +7779,12 @@ def parse_args():
         choices=("auto", "zh", "ja"),
         default="auto",
         help="游戏界面语言：auto 自动识别，zh 简体中文，ja 日文",
+    )
+    parser.add_argument(
+        "--recognition-profile",
+        choices=tuple(RECOGNITION_PROFILES),
+        default="auto",
+        help="识别画面适配档位；实际客户区会自动裁剪黑边并按比例缩放",
     )
     parser.add_argument("--l2-key", default=L2_KEY, help="Chiaki 中 L2 对应的键盘按键，默认 L")
     parser.add_argument(
@@ -5824,9 +7806,11 @@ def parse_args():
             REFOCUS_MODE_BOSS_RING,
             REFOCUS_MODE_L2_RING,
             REFOCUS_MODE_L2_SBA,
+            REFOCUS_MODE_SBA_RING_GUARDED,
+            REFOCUS_MODE_RING_ARC_EXPERIMENT,
         ),
         default=REFOCUS_MODE_DEFAULT,
-        help="索敌方案：近战/法系、远程、BOSS蓝条+锁定环、目标环实验或持续L2实验",
+        help="索敌方案：近战/法系、远程、BOSS环实验、目标环实验、持续L2、奥义保护或部分圆弧实验",
     )
     parser.add_argument(
         "--max-battles",
@@ -5994,6 +7978,35 @@ def _find_window_handle(title: str) -> int | None:
     return found[0] if found else None
 
 
+def _resize_window_client_area(hwnd: int, width: int, height: int) -> bool:
+    """Set a Chiaki HWND's client area to an exact 16:9 size."""
+    import win32con
+    import win32gui
+
+    if not hwnd or not win32gui.IsWindow(hwnd) or win32gui.IsIconic(hwnd):
+        return False
+    client_left, client_top = win32gui.ClientToScreen(hwnd, (0, 0))
+    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+    ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+    adjusted = adjust_window_rect_ex(
+        (0, 0, int(width), int(height)), style, False, ex_style
+    )
+    outer_width = adjusted[2] - adjusted[0]
+    outer_height = adjusted[3] - adjusted[1]
+    flags = win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
+    win32gui.SetWindowPos(
+        hwnd,
+        0,
+        client_left + adjusted[0],
+        client_top + adjusted[1],
+        outer_width,
+        outer_height,
+        flags,
+    )
+    c_left, c_top, c_right, c_bottom = win32gui.GetClientRect(hwnd)
+    return (c_right - c_left, c_bottom - c_top) == (int(width), int(height))
+
+
 def _find_window(title: str) -> bool:
     return _find_window_handle(title) is not None
 
@@ -6056,19 +8069,14 @@ def _ensure_gui_admin() -> bool:
     if ctypes.windll.shell32.IsUserAnAdmin():
         return True
 
-    # Nuitka does not always expose the same ``sys.frozen`` marker as
-    # PyInstaller. Use the compiled marker too, otherwise a compiled EXE can
-    # accidentally relaunch through its temporary Python entry path.
     compiled = bool(getattr(sys, "frozen", False) or globals().get("__compiled__"))
-    if compiled:
-        executable_path = Path(sys.executable).resolve()
-        executable = str(executable_path)
-        parameters = subprocess.list2cmdline(sys.argv[1:])
-    else:
-        executable_path = Path(sys.executable).resolve()
-        executable = str(executable_path)
-        parameters = subprocess.list2cmdline([str(Path(__file__).resolve()), *sys.argv[1:]])
-
+    executable_path = Path(sys.executable).resolve()
+    executable = str(executable_path)
+    parameters = subprocess.list2cmdline(
+        sys.argv[1:]
+        if compiled
+        else [str(Path(__file__).resolve()), *sys.argv[1:]]
+    )
     working_directory = executable_path.parent
     if not executable_path.is_file():
         message = (
@@ -6076,41 +8084,22 @@ def _ensure_gui_admin() -> bool:
             f"启动文件：{executable_path}"
         )
         log.error(message.replace("\n", " | "))
-        ctypes.windll.user32.MessageBoxW(
-            None, message, "Chiaki + GBFR 自动重战", 0x10
-        )
+        ctypes.windll.user32.MessageBoxW(None, message, "Chiaki + GBFR 自动重战", 0x10)
         return False
 
     result = ctypes.windll.shell32.ShellExecuteW(
-        None,
-        "runas",
-        executable,
-        parameters,
-        str(working_directory),
-        1,
+        None, "runas", executable, parameters, str(working_directory), 1
     )
     if result <= 32:
-        try:
-            last_error = ctypes.get_last_error()
-        except (AttributeError, OSError):
-            last_error = 0
         detail = _shell_execute_error_text(result)
         log.error(
-            "管理员提权失败 | ShellExecuteW=%s (%s) | GetLastError=%s | exe=%s | cwd=%s | 参数=%s",
-            result,
-            detail,
-            last_error,
-            executable_path,
-            working_directory,
-            parameters or "<无>",
+            "管理员提权失败 | ShellExecuteW=%s (%s) | exe=%s | cwd=%s | 参数=%s",
+            result, detail, executable_path, working_directory, parameters or "<无>",
         )
         ctypes.windll.user32.MessageBoxW(
             None,
             "无法获取管理员权限，自动重战无法启动。\n\n"
-            f"原因：{detail}\n"
-            f"启动文件：{executable_path}\n\n"
-            "请优先双击‘启动工具.cmd’，不要对 .cmd 使用‘以管理员身份运行’。\n"
-            "如果仍失败，请把 logs 文件夹中的最新日志一并提供。",
+            f"原因：{detail}\n启动文件：{executable_path}",
             "Chiaki + GBFR 自动重战",
             0x10,
         )
@@ -6273,6 +8262,20 @@ def run_unified_gui(args) -> int:
         saved_language = "auto"
     language_label_to_code = {label: code for code, label in UI_LANGUAGE_LABELS.items()}
     ui_language_var = tk.StringVar(value=UI_LANGUAGE_LABELS[saved_language])
+    recognition_profile_var = tk.StringVar(
+        value=str(saved_settings.get("recognition_profile", "auto"))
+    )
+    if recognition_profile_var.get() not in RECOGNITION_PROFILES:
+        recognition_profile_var.set("auto")
+    recognition_profile_labels = {
+        key: str(value["label"]) for key, value in RECOGNITION_PROFILES.items()
+    }
+    recognition_profile_label_to_code = {
+        label: key for key, label in recognition_profile_labels.items()
+    }
+    def selected_recognition_profile_code() -> str:
+        value = recognition_profile_var.get()
+        return recognition_profile_label_to_code.get(value, value if value in RECOGNITION_PROFILES else "auto")
     path_var = tk.StringVar(value=initial_chiaki_path)
     auto_recover = tk.BooleanVar(value=bool(saved_settings.get("auto_recover", False)))
     reconnect_nickname_var = tk.StringVar(
@@ -6815,6 +8818,7 @@ def run_unified_gui(args) -> int:
         settings["ui_language"] = language_label_to_code.get(
             ui_language_var.get(), "auto"
         )
+        settings["recognition_profile"] = selected_recognition_profile_code()
         settings["chiaki_exe"] = path_var.get().strip()
         settings["auto_recover"] = bool(auto_recover.get())
         settings["reconnect_nickname"] = reconnect_nickname_var.get().strip()
@@ -6858,6 +8862,46 @@ def run_unified_gui(args) -> int:
             )
         else:
             set_status(f"界面语言已应用：{UI_LANGUAGE_LABELS[code]}")
+
+    def restore_chiaki_resolution(profile: str) -> None:
+        """Restore one of the supported 16:9 Chiaki client-area presets."""
+        sizes = {
+            "chiaki_360p": (640, 360),
+            "chiaki_540p": (960, 540),
+            "chiaki_720p": (1280, 720),
+            "chiaki_1080p": (1920, 1080),
+        }
+        size = sizes[profile]
+        # Resolve the live stream window before changing its geometry.  This
+        # also refreshes custom Chiaki titles instead of relying on a stale
+        # title field from a previous session.
+        if not capture_stream_window_title(show_feedback=False):
+            messagebox.showwarning(
+                "未捕获到 Chiaki 串流窗口",
+                "请先打开并连接 Chiaki 串流，再恢复分辨率。",
+                parent=root,
+            )
+            return
+        hwnd = _find_window_handle(title_var.get().strip())
+        if hwnd is None:
+            messagebox.showwarning(
+                "未找到 Chiaki 串流窗口",
+                "请先打开 Chiaki 串流，并确认窗口标题与上方配置一致。",
+                parent=root,
+            )
+            return
+        if _resize_window_client_area(hwnd, *size):
+            recognition_profile_var.set(recognition_profile_labels[profile])
+            save_background_choice()
+            set_status(
+                f"Chiaki 客户区已恢复为 {size[0]}×{size[1]}；识别档位已同步，等待画面稳定后再启动自动化"
+            )
+        else:
+            messagebox.showwarning(
+                "Chiaki 分辨率恢复失败",
+                "窗口可能处于最小化状态，或系统拒绝了尺寸调整。请恢复窗口后重试。",
+                parent=root,
+            )
 
     def apply_window_title() -> None:
         """Persist the title and refresh a running child capture immediately."""
@@ -7525,6 +9569,8 @@ def run_unified_gui(args) -> int:
         # unexpected positional argument and exited with code 2.
         command = _self_command()
         command.extend(("--launcher-pid", str(os.getpid())))
+        if args.debug:
+            command.append("--debug")
         if run_in_background:
             command.append("--background")
         command.extend(("--window-title", title_var.get()))
@@ -7534,6 +9580,7 @@ def run_unified_gui(args) -> int:
                 language_label_to_code.get(ui_language_var.get(), "auto"),
             )
         )
+        command.extend(("--recognition-profile", selected_recognition_profile_code()))
         command.extend(
             (
                 "--refocus-mode",
@@ -7658,6 +9705,8 @@ def run_unified_gui(args) -> int:
                 title_var.get(),
                 "--ui-language",
                 language_label_to_code.get(ui_language_var.get(), "auto"),
+                "--recognition-profile",
+                selected_recognition_profile_code(),
                 "--ability-config-file",
                 str(ability_config_path),
                 "--ability-stats-file",
@@ -8887,6 +10936,53 @@ def run_unified_gui(args) -> int:
         fg="#666",
         anchor="w",
     ).grid(row=0, column=3, padx=(14, 0), sticky="ew")
+    tk.Label(language_frame, text="识别画面档位").grid(
+        row=1, column=0, padx=(0, 8), pady=(3, 2), sticky="w"
+    )
+    recognition_profile_combo = ttk.Combobox(
+        language_frame,
+        textvariable=recognition_profile_var,
+        values=tuple(recognition_profile_labels.values()),
+        state="readonly",
+        width=25,
+    )
+    recognition_profile_combo.set(
+        recognition_profile_labels.get(recognition_profile_var.get(), recognition_profile_labels["auto"])
+    )
+    recognition_profile_combo.grid(row=1, column=1, pady=(3, 2), sticky="w")
+    recognition_profile_combo.bind(
+        "<<ComboboxSelected>>",
+        lambda _event: save_background_choice(),
+    )
+    tk.Label(
+        language_frame,
+        text="按实际像素档位归一化；拖动 Chiaki 后自动重新取样，前后台规则一致",
+        fg="#666",
+        anchor="w",
+    ).grid(row=1, column=3, padx=(14, 0), pady=(3, 2), sticky="ew")
+    tk.Label(language_frame, text="恢复 Chiaki 画面").grid(
+        row=2, column=0, padx=(0, 8), pady=(4, 2), sticky="w"
+    )
+    resolution_buttons = tk.Frame(language_frame)
+    resolution_buttons.grid(row=2, column=1, columnspan=2, pady=(4, 2), sticky="w")
+    for profile, label in (
+        ("chiaki_360p", "恢复 360p"),
+        ("chiaki_540p", "恢复 540p"),
+        ("chiaki_720p", "恢复 720p"),
+        ("chiaki_1080p", "恢复 1080p"),
+    ):
+        tk.Button(
+            resolution_buttons,
+            text=label,
+            command=lambda selected=profile: restore_chiaki_resolution(selected),
+            width=12,
+        ).pack(side="left", padx=(0, 5))
+    tk.Label(
+        language_frame,
+        text="仅调整 Chiaki 窗口客户区，不改变 PS5 编码流；调整后识别档位会同步",
+        fg="#666",
+        anchor="w",
+    ).grid(row=2, column=3, padx=(14, 0), pady=(4, 2), sticky="ew")
 
     refocus_home_frame = tk.LabelFrame(root, text="战斗索敌方案")
     refocus_home_frame.grid(row=3, column=0, columnspan=3, padx=12, pady=(2, 6), sticky="ew")
@@ -9262,6 +11358,7 @@ def run_unified_gui(args) -> int:
 # ============================================================
 if __name__ == "__main__":
     args = parse_args()
+    DEBUG_MODE = bool(args.debug or os.environ.get("GBFR_DEBUG", "").strip() == "1")
     if args.diagnostics:
         print(f"windows-capture: {'可用' if WindowsCapture is not None else '缺失'}")
         print(f"vgamepad: {'可用' if vg is not None else '缺失'}")
@@ -9297,9 +11394,17 @@ if __name__ == "__main__":
         # uses text detection and is evaluated only after the cheap battle HUD
         # markers have already matched.
         "战斗右半屏": [0.50, 0.0, 1.0, 1.0],
+        # The retry label is a narrow line within the lower-left blue bar.
+        # Keep the crop tight: on a real client-area capture its y=0.885..0.922
+        # range aligns with the text; a broad crop makes recognition-only OCR
+        # return an empty string because it includes the decoration bar.
         "再次": [0.075, 0.885, 0.245, 0.922],
         "撤销": [0.075, 0.885, 0.245, 0.922],
-        "结算": [0.4489, 0.3231, 0.5578, 0.3787],
+        # The old narrow crop works on a large client but loses the Japanese
+        # result title on small/compressed windows. Center-page OCR uses this
+        # wider crop and its own enhanced passes; coordinate-bearing controls
+        # continue to use their dedicated narrow regions.
+        "结算": [0.20, 0.15, 0.80, 0.62],
         "挑战": [0.4489, 0.3231, 0.5578, 0.3787],
         # Keep the historical narrow prompt crop.  It covers both Chinese
         # ``继续`` and Japanese ``次へ`` while excluding the countdown, so
@@ -9308,6 +11413,43 @@ if __name__ == "__main__":
     }
 
     log = Log("GBFR", "i").logger
+    if DEBUG_MODE:
+        debug_config = {
+            "ui_language": args.ui_language,
+            "background": args.background,
+            "window_title": args.window_title,
+            "refocus_mode": args.refocus_mode,
+            "l2_key": args.l2_key,
+            "input_profile": args.input_profile or "",
+            "auto_recover": args.auto_recover,
+            "reconnect_once": args.reconnect_once,
+            "freeze_timeout_seconds": args.freeze_timeout_seconds,
+        }
+        DEBUG_DIAGNOSTIC_PATH = (
+            Path(get_runtime_log_dir())
+            / f"debug-recovery-{datetime.now().strftime('%Y%m%d-%H%M%S')}.jsonl"
+        )
+        try:
+            DEBUG_DIAGNOSTIC_PATH.write_text(
+                json.dumps(
+                    {
+                        "type": "config",
+                        "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+                        "config": debug_config,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            log.info("DEBUG 诊断文件：%s", DEBUG_DIAGNOSTIC_PATH)
+        except OSError as exc:
+            DEBUG_DIAGNOSTIC_PATH = None
+            log.warning("DEBUG 诊断文件创建失败，仍保留普通日志：%s", exc)
+        log.warning(
+            "DEBUG 模式已启用；仅记录恢复诊断，不改变自动按键逻辑：%s",
+            json.dumps(debug_config, ensure_ascii=False),
+        )
     stats_path = Path(args.stats_file) if args.stats_file else Path(get_runtime_log_dir()) / "session-stats.json"
     SCHEDULE_FILE = Path(args.schedule_file) if args.schedule_file else None
     try:
@@ -9434,6 +11576,7 @@ if __name__ == "__main__":
         invert_movement=args.invert_movement,
         allow_missing_window=args.reconnect_once,
         ui_language=args.ui_language,
+        recognition_profile=args.recognition_profile,
     )
     if not args.background and synchronized_mapping is not None:
         relink.set_automation_release_keys(synchronized_mapping.values())

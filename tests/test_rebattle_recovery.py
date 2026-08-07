@@ -2,11 +2,19 @@ import threading
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+from time import monotonic
 
 import main
 import numpy as np
 from PIL import Image, ImageDraw
-from module.controller import Controller, stream_caption_matches_target
+from module.controller import (
+    Controller,
+    crop_normalized_relative_region,
+    crop_window_capture_to_client_area,
+    normalize_recognition_frame,
+    prepare_ocr_image,
+    stream_caption_matches_target,
+)
 
 
 class FakeRelink:
@@ -65,6 +73,285 @@ class ImageRelink:
 
 
 class ReBattleRecoveryTests(unittest.TestCase):
+    def tearDown(self):
+        # The production state is process-wide because watchdog threads and
+        # state machines live in the same process. Keep tests isolated even
+        # when an assertion fails while a transaction is held.
+        main.clear_automation_flow_state("测试清理")
+
+    def test_automation_flow_is_reentrant_and_blocks_other_threads(self):
+        entered = threading.Event()
+        release = threading.Event()
+        observed = []
+
+        def owner():
+            with main.automation_flow("town_recovery") as acquired:
+                observed.append(acquired)
+                with main.automation_flow("quest_navigation") as nested:
+                    observed.append(nested)
+                    entered.set()
+                    release.wait(timeout=2.0)
+
+        worker = threading.Thread(target=owner)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+        self.assertTrue(main.automation_flow_active())
+        self.assertEqual(main.automation_flow_name(), "town_recovery > quest_navigation")
+        with main.automation_flow("stream_recovery") as acquired:
+            self.assertFalse(acquired)
+        release.set()
+        worker.join(timeout=2.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(observed, [True, True])
+        self.assertFalse(main.automation_flow_active())
+
+    def test_reconnect_route_defers_while_other_flow_owns_navigation(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def owner():
+            with main.automation_flow("town_recovery"):
+                entered.set()
+                release.wait(timeout=2.0)
+
+        worker = threading.Thread(target=owner)
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+        relink = FakeRelink()
+        with patch.object(main, "_route_reconnected_screen_impl") as route:
+            self.assertIsNone(main.route_reconnected_screen(relink, timeout=1.0))
+        route.assert_not_called()
+        release.set()
+        worker.join(timeout=2.0)
+
+    def test_stream_window_watchdog_defers_when_flow_is_active(self):
+        class MissingWindowRelink(FakeRelink):
+            def stream_binding_is_valid(self):
+                return False
+
+        relink = MissingWindowRelink()
+        began = []
+
+        def stop_after_poll(_seconds):
+            relink.running = False
+
+        with patch.dict(
+            main.RECOVERY_CONFIG,
+            {"chiaki_exe": str(Path(main.__file__)), "nickname": "PS5", "host": "127.0.0.1"},
+            clear=True,
+        ), patch.object(main, "automation_flow_name", return_value="town_recovery"), patch.object(
+            main, "sleep", side_effect=stop_after_poll
+        ):
+            main.stream_window_watchdog(
+                relink,
+                lambda: False,
+                lambda: began.append(True),
+                lambda _phase: None,
+            )
+        self.assertEqual(began, [])
+
+    def test_recognition_profiles_upscale_low_resolution_without_stretching(self):
+        frame = Image.new("RGB", (640, 360), (20, 30, 40))
+        normalized, metadata = normalize_recognition_frame(frame, "chiaki_360p")
+        self.assertEqual(normalized.size, (640, 360))
+        self.assertEqual(metadata["source_size"], (640, 360))
+        self.assertFalse(metadata["letterbox_detected"])
+
+    def test_small_ocr_crops_are_upscaled_but_full_canvas_is_unchanged(self):
+        small = Image.new("RGB", (80, 24), (20, 30, 40))
+        medium = Image.new("RGB", (640, 120), (20, 30, 40))
+        low_resolution_full = Image.new("RGB", (1280, 720), (20, 30, 40))
+        full = Image.new("RGB", (1920, 1080), (20, 30, 40))
+        self.assertEqual(prepare_ocr_image(small).size, (240, 72))
+        self.assertEqual(prepare_ocr_image(medium).size, (1280, 240))
+        self.assertEqual(prepare_ocr_image(low_resolution_full).size, low_resolution_full.size)
+        self.assertEqual(prepare_ocr_image(full).size, full.size)
+
+    def test_relative_regions_use_normalized_client_canvas_at_540p(self):
+        # A 540p HWND capture may be physically 962x572 and then crop to a
+        # DPI-virtualized 946x533 client frame. After normalization, regions
+        # must use the 960x540 client canvas directly, not the old outer size.
+        canvas = Image.new("RGB", (960, 540), (0, 0, 0))
+        crop = crop_normalized_relative_region(canvas, (0.70, 0.60, 0.90, 0.80))
+        self.assertEqual(crop.size, (192, 108))
+
+    def test_screenshot_text_crops_from_normalized_canvas_not_window_chrome(self):
+        relink = Controller.__new__(Controller)
+        relink.text2region = {"继续": (0.70, 0.60, 0.90, 0.80)}
+        relink.window_rect = (100, 100, 962, 572)
+        relink.screenshot = lambda region=None: Image.new("RGB", (960, 540), (0, 0, 0))
+        self.assertEqual(relink.screenshot_text("继续").size, (192, 108))
+
+    def test_ocr_resize_policy_uses_low_resolution_profile_and_bounds_large_crops(self):
+        small = Image.new("RGB", (80, 24), (20, 30, 40))
+        medium = Image.new("RGB", (640, 120), (20, 30, 40))
+        large = Image.new("RGB", (1600, 1000), (20, 30, 40))
+        self.assertEqual(
+            prepare_ocr_image(small, "chiaki_360p").size,
+            (240, 72),
+        )
+        self.assertGreaterEqual(
+            prepare_ocr_image(medium, "chiaki_540p").width,
+            medium.width * 2,
+        )
+        bounded = prepare_ocr_image(large, "chiaki_1080p")
+        self.assertLessEqual(bounded.width * bounded.height, 1600000)
+
+    def test_ocr_resize_budget_handles_fractional_scale_with_integral_dimensions(self):
+        # 900x400 at the 540p policy starts at 2x (1.44M pixels), so the
+        # budget clamps it to a non-integer scale of sqrt(1M / 360k). This
+        # used to pass floats directly to Pillow and repeatedly disable OCR.
+        bounded = prepare_ocr_image(
+            Image.new("RGB", (900, 400), (20, 30, 40)), "chiaki_540p"
+        )
+        self.assertEqual(bounded.size, (1500, 666))
+        self.assertTrue(all(isinstance(value, int) for value in bounded.size))
+        self.assertLessEqual(bounded.width * bounded.height, 1000000)
+
+    def test_ocr_coordinates_are_mapped_back_after_low_resolution_upscale(self):
+        class FakeModel:
+            def __call__(self, image, use_det=True, use_cls=False):
+                self.received_size = image.size
+                return [
+                    ([[30, 15], [150, 15], [150, 45], [30, 45]], "测试", 0.99)
+                ], None
+
+        relink = Controller.__new__(Controller)
+        relink.recognition_profile = "chiaki_360p"
+        relink.ocrmodels = {"zh": FakeModel()}
+        relink.detected_ui_language = "zh"
+        relink._ocr_lock = threading.Lock()
+        items = relink.ocr(Image.new("RGB", (80, 24), (20, 30, 40)), language="zh")
+        self.assertEqual(relink.ocrmodels["zh"].received_size, (240, 72))
+        self.assertEqual(items[0]["location"], (9, 4, 51, 16))
+
+    def test_fixed_chiaki_profiles_keep_one_16_9_geometry(self):
+        expected = {
+            "chiaki_360p": (640, 360),
+            "chiaki_540p": (960, 540),
+            "chiaki_720p": (1280, 720),
+            "chiaki_1080p": (1920, 1080),
+        }
+        self.assertEqual(
+            set(main.RECOGNITION_PROFILES) - {"auto"}, set(expected)
+        )
+        for profile, size in expected.items():
+            frame = Image.new("RGB", size, (30, 40, 50))
+            normalized, metadata = normalize_recognition_frame(frame, profile)
+            self.assertEqual(normalized.size, size)
+            self.assertEqual(metadata["normalized_size"], size)
+            self.assertAlmostEqual(size[0] / size[1], 16 / 9, places=6)
+
+    def test_auto_profile_uses_nearest_chiaki_rung_for_full_frame_ocr(self):
+        expected = {
+            (640, 360): "chiaki_360p",
+            (960, 540): "chiaki_540p",
+            (1280, 720): "chiaki_720p",
+            (1920, 1080): "chiaki_1080p",
+        }
+        for source_size, canvas in expected.items():
+            with self.subTest(source_size=source_size):
+                frame = Image.new("RGB", source_size, (30, 40, 50))
+                normalized, metadata = normalize_recognition_frame(frame, "auto")
+                self.assertEqual(normalized.size, source_size)
+                self.assertEqual(metadata["normalization_canvas"], canvas)
+
+    def test_settlement_center_enhancement_is_fallback_only(self):
+        class OcrProbe(FakeRelink):
+            def __init__(self, result):
+                super().__init__(languages=("zh",))
+                self.image = Image.new("RGB", (80, 40), (20, 30, 40))
+                self.result = result
+                self.calls = []
+
+            def screenshot_text(self, _region):
+                return self.image
+
+            def ocr(self, image, confidence=0.35, language=None):
+                self.calls.append(image)
+                return self.result
+
+        hit = OcrProbe([{"text": "结算确认"}])
+        self.assertEqual(main.read_settlement_center_texts(hit), {"zh": "结算确认"})
+        self.assertEqual(len(hit.calls), 1)
+
+        miss = OcrProbe([])
+        self.assertEqual(main.read_settlement_center_texts(miss), {"zh": ""})
+        self.assertEqual(len(miss.calls), 3)
+
+    def test_recognition_profiles_crop_confident_16_10_black_bars(self):
+        frame = Image.new("RGB", (1920, 1200), (0, 0, 0))
+        game = Image.new("RGB", (1920, 1080), (35, 45, 55))
+        frame.paste(game, (0, 60))
+        normalized, metadata = normalize_recognition_frame(frame, "auto")
+        self.assertEqual(metadata["content_rect"], (0, 60, 1920, 1080))
+        self.assertTrue(metadata["letterbox_detected"])
+        self.assertEqual(normalized.size, (1920, 1080))
+
+    def test_recognition_profiles_preserve_unusual_non_black_client(self):
+        frame = Image.new("RGB", (1920, 1200), (35, 45, 55))
+        normalized, metadata = normalize_recognition_frame(frame, "auto")
+        self.assertEqual(metadata["content_rect"], (0, 0, 1920, 1200))
+        self.assertFalse(metadata["letterbox_detected"])
+        self.assertLessEqual(normalized.width, 1920)
+
+    def test_background_window_capture_is_cropped_back_to_client_area(self):
+        frame = Image.new("RGB", (962, 572), (10, 10, 10))
+        ImageDraw.Draw(frame).rectangle((1, 31, 960, 570), fill=(40, 120, 200))
+        cropped = crop_window_capture_to_client_area(
+            frame, (100, 100, 1062, 672), (101, 131, 1061, 671)
+        )
+        self.assertEqual(cropped.size, (960, 540))
+        self.assertEqual(cropped.getpixel((0, 0)), (40, 120, 200))
+
+    def test_client_only_background_capture_is_not_cropped_twice(self):
+        frame = Image.new("RGB", (960, 540), (40, 120, 200))
+        cropped = crop_window_capture_to_client_area(
+            frame, (100, 100, 1062, 672), (101, 131, 1061, 671)
+        )
+        self.assertEqual(cropped.size, (960, 540))
+
+    def test_auto_profile_bounds_4k_ocr_canvas(self):
+        frame = Image.new("RGB", (3840, 2160), (35, 45, 55))
+        normalized, metadata = normalize_recognition_frame(frame, "auto")
+        self.assertEqual(normalized.size, (1920, 1080))
+        self.assertEqual(metadata["scale"], 0.5)
+
+    def test_resize_settling_fence_is_shared_by_controller_input_modes(self):
+        relink = Controller.__new__(Controller)
+        relink._geometry_changed_at = monotonic()
+        self.assertTrue(relink.recognition_resize_settling())
+        relink._geometry_changed_at = monotonic() - 2.0
+        self.assertFalse(relink.recognition_resize_settling())
+
+    def test_window_move_does_not_start_resize_settling(self):
+        relink = Controller.__new__(Controller)
+        relink.window_rect = (100, 100, 960, 540)
+        relink.geometry_generation = 0
+        relink._geometry_changed_at = 0.0
+        relink._window_was_iconic = False
+        relink._get_hwnd = lambda: 1
+        with patch("module.controller.win32gui.IsIconic", return_value=False), \
+             patch("module.controller.win32gui.GetClientRect", return_value=(0, 0, 960, 540)), \
+             patch("module.controller.win32gui.ClientToScreen", side_effect=[(120, 130), (1080, 670)]):
+            rect = relink.get_window_rect(silent=True)
+        self.assertEqual(rect, (120, 130, 960, 540))
+        self.assertFalse(relink.recognition_resize_settling())
+
+    def test_window_resize_starts_settling_once(self):
+        relink = Controller.__new__(Controller)
+        relink.window_rect = (100, 100, 960, 540)
+        relink.geometry_generation = 0
+        relink._geometry_changed_at = 0.0
+        relink._window_was_iconic = False
+        relink._get_hwnd = lambda: 1
+        with patch("module.controller.win32gui.IsIconic", return_value=False), \
+             patch("module.controller.win32gui.GetClientRect", return_value=(0, 0, 1280, 720)), \
+             patch("module.controller.win32gui.ClientToScreen", side_effect=[(100, 100), (1380, 820)]):
+            rect = relink.get_window_rect(silent=True)
+        self.assertEqual(rect, (100, 100, 1280, 720))
+        self.assertTrue(relink.recognition_resize_settling())
+
     def test_launcher_process_watch_ignores_an_unset_parent_pid(self):
         self.assertTrue(main.launcher_process_is_alive(0))
 
@@ -216,10 +503,27 @@ class ReBattleRecoveryTests(unittest.TestCase):
         japanese = JapaneseDialogRelink("ja", "ja")
         automatic = JapaneseDialogRelink("auto", None)
         chinese = JapaneseDialogRelink("zh", "zh")
-        with patch.object(main, "settlement_confirmation_selection", return_value="yes"):
+        with patch.object(
+            main, "settlement_confirmation_selection", return_value="yes"
+        ), patch.object(main, "detect_stable_result_ui", return_value="继续"):
             self.assertTrue(main.japanese_settlement_highlight_dialog_active(japanese))
             self.assertFalse(main.japanese_settlement_highlight_dialog_active(automatic))
         self.assertFalse(main.japanese_settlement_highlight_dialog_active(chinese))
+
+    def test_japanese_visual_confirmation_does_not_steal_next_prompt(self):
+        class JapaneseDialogRelink(FakeRelink):
+            ui_language_mode = "ja"
+            detected_ui_language = "ja"
+
+        relink = JapaneseDialogRelink(("ja",))
+        with patch.object(
+            main, "region_has_marker", return_value=True
+        ), patch.object(
+            main, "settlement_confirmation_selection", return_value="yes"
+        ), patch.object(
+            main, "detect_stable_result_ui", return_value="继续"
+        ):
+            self.assertFalse(main.japanese_settlement_highlight_dialog_active(relink))
 
     def test_japanese_visual_confirmation_can_establish_language_from_dialog(self):
         class JapaneseDialogRelink:
@@ -236,9 +540,86 @@ class ReBattleRecoveryTests(unittest.TestCase):
             return_value={"zh": "", "ja": "リザルト確認"},
         ), patch.object(
             main, "settlement_confirmation_selection", return_value="yes"
+        ), patch.object(
+            main, "detect_stable_result_ui", return_value="继续"
         ), patch.object(japanese, "confirm_ui_language") as confirm:
             self.assertTrue(main.japanese_settlement_highlight_dialog_active(japanese))
         confirm.assert_called_once_with("ja", "settlement_confirmation")
+
+    def test_japanese_visual_confirmation_does_not_fire_from_town_blue_hud(self):
+        class JapaneseDialogRelink(FakeRelink):
+            ui_language_mode = "ja"
+            detected_ui_language = "ja"
+
+        relink = JapaneseDialogRelink(("ja",))
+        with patch.object(
+            main, "settlement_confirmation_selection", return_value="yes"
+        ), patch.object(main, "detect_stable_result_ui", return_value=None):
+            self.assertFalse(main.japanese_settlement_highlight_dialog_active(relink))
+
+    def test_japanese_result_confirmation_uses_center_dialog_when_prompt_is_gone(self):
+        class JapaneseDialogRelink(FakeRelink):
+            ui_language_mode = "ja"
+            detected_ui_language = "ja"
+
+        relink = JapaneseDialogRelink(("ja",))
+        with patch.object(
+            main, "read_region_texts", return_value={"zh": "", "ja": "リザルト確認"}
+        ), patch.object(
+            main, "detect_stable_result_ui", return_value=None
+        ), patch.object(
+            main, "region_has_marker", return_value=False
+        ), patch.object(
+            main, "settlement_confirmation_selection", return_value="yes"
+        ):
+            self.assertTrue(main.japanese_settlement_highlight_dialog_active(relink))
+            self.assertEqual(
+                main.handle_japanese_settlement_highlight(relink), "confirmed"
+            )
+        self.assertEqual(relink.pressed, [(main.CROSS_KEY, None)])
+
+    def test_japanese_retry_button_never_enters_generic_highlight_fallback(self):
+        class JapaneseDialogRelink(FakeRelink):
+            ui_language_mode = "ja"
+            detected_ui_language = "ja"
+
+        relink = JapaneseDialogRelink(("ja",))
+        with patch.object(
+            main, "read_region_texts", return_value={"zh": "", "ja": "BATTLE RESULT"}
+        ), patch.object(
+            main, "read_japanese_result_retry_text", return_value="再挑戦する"
+        ), patch.object(
+            main, "settlement_confirmation_selection", return_value="yes"
+        ), patch.object(
+            main, "detect_stable_result_ui", return_value="继续"
+        ):
+            self.assertFalse(main.japanese_settlement_highlight_dialog_active(relink))
+
+    def test_japanese_next_cross_allows_one_followup_default_yes_confirmation(self):
+        class JapaneseDialogRelink(FakeRelink):
+            ui_language_mode = "ja"
+            detected_ui_language = "ja"
+
+        relink = JapaneseDialogRelink(("ja",))
+        with patch.object(main, "region_has_marker", return_value=True), patch.object(
+            main, "detect_stable_result_ui", return_value="继续"
+        ), patch.object(main, "settlement_confirmation_selection", return_value=None):
+            self.assertTrue(main.press_verified_result_continue(relink))
+        self.assertGreater(getattr(relink, "_japanese_result_confirmation_deadline", 0), main.time())
+
+        with patch.object(
+            main, "detect_stable_result_ui", return_value=None
+        ), patch.object(
+            main, "settlement_confirmation_selection", return_value="yes"
+        ), patch.object(main, "time", return_value=0.0):
+            # The pending deadline is in the future relative to the patched
+            # clock, so only the post-次へ confirmation is allowed here.
+            self.assertTrue(main.japanese_settlement_highlight_dialog_active(relink))
+            self.assertEqual(main.handle_japanese_settlement_highlight(relink), "confirmed")
+        self.assertEqual(
+            [key for key, _ in relink.pressed],
+            [main.CROSS_KEY, main.CROSS_KEY, main.CROSS_KEY, main.CROSS_KEY],
+        )
 
     def test_japanese_settlement_highlight_confirms_yes_directly(self):
         relink = FakeRelink()
@@ -248,6 +629,64 @@ class ReBattleRecoveryTests(unittest.TestCase):
             result = main.handle_japanese_settlement_highlight(relink)
         self.assertEqual(result, "confirmed")
         self.assertEqual(relink.pressed, [(main.CROSS_KEY, None)])
+
+    def test_japanese_retry_confirmation_moves_up_then_confirms_yes(self):
+        relink = FakeRelink(("ja",))
+        with patch.object(
+            main, "settlement_confirmation_selection", return_value="yes"
+        ), patch.object(relink, "wait_for_fresh_capture", return_value=True):
+            self.assertEqual(
+                main.handle_japanese_retry_confirmation(relink), "confirmed"
+            )
+        self.assertEqual(
+            [key for key, _ in relink.pressed], [main.D_PAD_UP_KEY, main.CROSS_KEY]
+        )
+
+    def test_japanese_retry_confirmation_marker_wins_over_enabled_retry_page(self):
+        relink = FakeRelink(("ja",))
+        with patch.object(
+            main,
+            "read_settlement_center_texts",
+            return_value={"zh": "", "ja": "再挑戦確認 引き続きこのクエストに挑戦しますか"},
+        ):
+            self.assertTrue(main.japanese_retry_confirmation_present(relink))
+
+    def test_japanese_retry_confirmation_title_crop_wins_before_retry_controls(self):
+        relink = FakeRelink(("ja",))
+        with patch.object(
+            main,
+            "read_japanese_retry_confirmation_title",
+            return_value="再挑戦確認",
+        ), patch.object(
+            main,
+            "read_settlement_center_texts",
+            side_effect=AssertionError("title crop should take priority"),
+        ):
+            self.assertTrue(main.japanese_retry_confirmation_present(relink))
+
+    def test_japanese_retry_confirmation_accepts_low_resolution_title_variant(self):
+        relink = FakeRelink(("ja",))
+        with patch.object(
+            main,
+            "read_settlement_center_texts",
+            return_value={"zh": "", "ja": "再排戦確譚"},
+        ):
+            self.assertTrue(main.japanese_retry_confirmation_present(relink))
+
+    def test_japanese_retry_confirmation_is_excluded_from_generic_highlight(self):
+        class JapaneseDialogRelink(FakeRelink):
+            ui_language_mode = "ja"
+            detected_ui_language = "ja"
+
+        relink = JapaneseDialogRelink(("ja",))
+        with patch.object(
+            main,
+            "read_region_texts",
+            return_value={"zh": "", "ja": "再挑戦確認"},
+        ), patch.object(
+            main, "settlement_confirmation_selection", return_value="yes"
+        ), patch.object(main, "detect_stable_result_ui", return_value="继续"):
+            self.assertFalse(main.japanese_settlement_highlight_dialog_active(relink))
 
     def test_unexpected_town_recovery_returns_router_outcome(self):
         relink = FakeRelink()
@@ -314,6 +753,63 @@ class ReBattleRecoveryTests(unittest.TestCase):
                 )
                 self.assertEqual(relink.confirmed[-1][0], language)
 
+    def test_japanese_fast_travel_marker_is_classified_before_quest_menu(self):
+        relink = FakeRelink(("ja",))
+        with patch.object(
+            main, "battle_hud_visual_candidate", return_value=(False, 0.0)
+        ), patch.object(main, "detect_stable_result_ui", return_value=None), patch.object(
+            main,
+            "full_frame_texts",
+            return_value={"zh": "", "ja": "移動先遥 鍛冶屋 決定"},
+        ):
+            self.assertEqual(
+                main.classify_reconnected_screen(relink, allow_town_menu=True),
+                "town_fast_travel",
+            )
+
+    def test_fast_travel_requires_matching_language_configuration(self):
+        relink = FakeRelink(("zh",))
+        with patch.object(
+            main, "battle_hud_visual_candidate", return_value=(False, 0.0)
+        ), patch.object(main, "detect_stable_result_ui", return_value=None), patch.object(
+            main,
+            "full_frame_texts",
+            return_value={"zh": "移動先遥 鍛冶屋 決定", "ja": ""},
+        ):
+            self.assertIsNone(
+                main.classify_reconnected_screen(relink, allow_town_menu=True)
+            )
+
+    def test_fast_travel_reuses_town_state_machine_without_second_l2(self):
+        relink = FakeRelink()
+        clock = {"value": 0.0}
+
+        def fake_time():
+            clock["value"] += 0.1
+            return clock["value"]
+
+        def fake_sleep(seconds):
+            clock["value"] += float(seconds)
+
+        # The router first performs a normal probe, then opens L2 and performs
+        # the town-menu probe with allow_town_menu=True.
+        states = iter((None, None, "town_fast_travel"))
+        with patch.object(main, "time", side_effect=fake_time), patch.object(
+            main, "sleep", side_effect=fake_sleep
+        ), patch.object(main, "frame_activity_signature", return_value=None), patch.object(
+            main, "classify_reconnected_screen", side_effect=states
+        ), patch.object(
+            main, "recover_last_town_quest", return_value=True
+        ) as recover:
+            outcome = main.route_reconnected_screen(relink, timeout=30.0)
+
+        self.assertEqual(outcome, "battle_wait")
+        recover.assert_called_once_with(relink, destination_menu_open=True)
+        self.assertEqual(
+            [key for key, _ in relink.pressed].count(main.L2_KEY), 1
+        )
+        self.assertNotIn((main.MOON_KEY, None), relink.pressed)
+
     def test_japanese_retry_ocr_variant_is_limited_to_result_control(self):
         self.assertTrue(
             main._text_matches_marker(
@@ -325,15 +821,63 @@ class ReBattleRecoveryTests(unittest.TestCase):
                 "ひ再規戦するあ）", "ja", "result_retry_any"
             )
         )
+        self.assertTrue(
+            main._text_matches_marker(
+                "再排製する", "ja", "result_retry_available"
+            )
+        )
+
+    def test_japanese_retry_fuzzy_ocr_accepts_partial_540p_forms(self):
+        self.assertEqual(main._japanese_retry_text_state("再挑戦す"), "available")
+        self.assertEqual(main._japanese_retry_text_state("再排製"), "available")
+        self.assertEqual(main._japanese_retry_text_state("再戦"), "available")
+        self.assertEqual(main._japanese_retry_text_state("再挑戦をキヤンセル"), "enabled")
+        self.assertIsNone(main._japanese_retry_text_state("獲得報酬"))
+
+    def test_japanese_retry_state_uses_lower_left_button_fallback(self):
+        class RetryRelink(FakeRelink):
+            def screenshot(self):
+                return Image.new("RGB", (960, 540), (0, 0, 0))
+
+            def ocr(self, image, confidence=0.40, language=None):
+                self.ocr_region = image.size
+                return [{"text": "再挑戦する"}]
+
+        relink = RetryRelink(("ja",))
+        with patch.object(
+            main, "read_region_texts", return_value={"zh": "", "ja": ""}
+        ), patch.object(
+            main, "result_repeat_indicator_is_stably_gold", return_value=False
+        ):
+            self.assertEqual(main.result_retry_state(relink), "available")
+        self.assertEqual(relink.ocr_region, (1440, 456))
+
+    def test_japanese_retry_cancel_text_requires_gold_indicator(self):
+        relink = FakeRelink(("ja",))
+        with patch.object(
+            main, "read_region_texts", return_value={"zh": "", "ja": "キャンセル"}
+        ), patch.object(
+            main, "result_repeat_indicator_is_stably_gold", return_value=False
+        ):
+            self.assertIsNone(main.result_retry_state(relink))
+
+    def test_japanese_result_continue_accepts_final_glyph_from_narrow_crop(self):
+        self.assertTrue(main._text_matches_marker("へ", "ja", "result_continue"))
 
     def test_japanese_challenge_confirmation_accepts_short_event_forms(self):
-        for text in ("再挑戦", "再規戦する", "挑戦", "再戦", "戦"):
+        for text in ("再挑戦", "再規戦する", "挑戦する", "再戦"):
             with self.subTest(text=text):
                 self.assertTrue(
                     main._text_matches_marker(
                         text, "ja", "challenge_confirmation"
                     )
                 )
+
+        self.assertFalse(
+            main._text_matches_marker(
+                "戦闘報酬を獲得", "ja", "challenge_confirmation"
+            )
+        )
 
     def test_japanese_challenge_confirmation_accepts_common_choice_pairs(self):
         for text in (
@@ -445,6 +989,69 @@ class ReBattleRecoveryTests(unittest.TestCase):
             main.japanese_ready_dialog_structure_matches("確認 OK キャンセル")
         )
 
+    def test_town_recovery_backs_out_of_abandon_confirmation_before_box(self):
+        relink = FakeRelink(("zh",))
+
+        def marker(_relink, _texts, semantic):
+            return semantic == "quest_abandon_confirmation"
+
+        with patch.object(main, "sleep"), patch.object(
+            main, "detect_stable_battle_hud", side_effect=(False, True)
+        ), patch.object(
+            main,
+            "full_frame_texts",
+            return_value={"zh": "确定要放弃已承接的任务吗？", "ja": ""},
+        ), patch.object(main, "full_frame_has_marker", side_effect=marker), patch.object(
+            main, "town_ready_confirmation_is_confirmable", return_value=(False, None, {})
+        ), patch.object(main, "town_ready_confirmation_dialog_present", return_value=False), patch.object(
+            main, "town_ready_panel_present", return_value=False
+        ), patch.object(main, "press_recovery_moon") as press_moon:
+            self.assertTrue(main.recover_last_town_quest(relink, destination_menu_open=True))
+
+        self.assertEqual(press_moon.call_count, 3)
+
+    def test_ready_page_abandon_menu_does_not_trigger_three_moons(self):
+        relink = FakeRelink(("zh",))
+        with patch.object(main, "full_frame_has_marker", return_value=True):
+            self.assertFalse(
+                main.town_quest_abandon_confirmation_present(
+                    relink,
+                    {"zh": "查看/放弃已承接任务 准备完毕 取消 确定", "ja": ""},
+                )
+            )
+
+    def test_accepted_quest_holds_navigation_when_box_is_temporarily_missing(self):
+        relink = FakeRelink(("zh",))
+        box_states = iter((False, False, True))
+        with patch.object(main, "sleep"), patch.object(
+            main, "detect_stable_battle_hud", side_effect=(False, False, False, True)
+        ), patch.object(
+            main,
+            "full_frame_texts",
+            return_value={"zh": "已承接任务", "ja": ""},
+        ), patch.object(
+            main, "town_ready_panel_present", side_effect=lambda _relink: next(box_states)
+        ), patch.object(
+            main, "town_ready_confirmation_is_confirmable", return_value=(False, None, {})
+        ), patch.object(
+            main, "town_ready_confirmation_dialog_present", return_value=False
+        ), patch.object(main, "press_recovery_cross") as press_cross, patch.object(
+            main, "press_recovery_square"
+        ) as press_square:
+            self.assertTrue(main.recover_last_town_quest(relink, destination_menu_open=True))
+
+        # The initial task-center entry Cross is expected; no generic Cross
+        # may be sent while the accepted-quest page waits for Box.
+        self.assertEqual(press_cross.call_count, 1)
+        self.assertEqual(press_cross.call_args.args, (relink, 2.5))
+        press_square.assert_called_once_with(relink, 2.0)
+
+    def test_quest_action_label_does_not_latch_accepted_quest_wait(self):
+        self.assertFalse(main.town_quest_accepted_state_present({"zh": "开始任务", "ja": ""}))
+        self.assertFalse(main.town_quest_accepted_state_present({"zh": "查看已承接任务", "ja": ""}))
+        self.assertTrue(main.town_quest_accepted_state_present({"zh": "已承接任务", "ja": ""}))
+        self.assertTrue(main.town_quest_accepted_state_present({"zh": "", "ja": "受注しました"}))
+
     def test_battle_timer_marker_supports_both_client_languages(self):
         for language, marker in (("zh", "剩余时间 08:12"), ("ja", "残り時間 08:12")):
             with self.subTest(language=language):
@@ -490,7 +1097,69 @@ class ReBattleRecoveryTests(unittest.TestCase):
 
         self.assertFalse(main.result_repeat_indicator_is_gold(ImageRelink(off)))
         self.assertTrue(main.result_repeat_indicator_is_gold(ImageRelink(on)))
-        self.assertEqual(main.result_retry_state(ImageRelink(on)), "enabled")
+        self.assertIsNone(main.result_retry_state(ImageRelink(on)))
+
+    def test_retry_action_bar_visually_distinguishes_the_second_result_page(self):
+        summary = Image.new("RGB", (1000, 1000), (60, 60, 55))
+        retry_page = summary.copy()
+        draw = ImageDraw.Draw(retry_page)
+        draw.rectangle((30, 890, 250, 925), fill=(45, 105, 150))
+
+        self.assertFalse(main.result_repeat_control_is_visible(ImageRelink(summary)))
+        self.assertTrue(main.result_repeat_control_is_visible(ImageRelink(retry_page)))
+
+    def test_japanese_retry_page_uses_white_ps5_button_marker(self):
+        image = Image.new("RGB", (1000, 1000), (40, 55, 80))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((75, 885, 115, 925), fill=(235, 235, 235))
+        self.assertTrue(main.result_repeat_ps_button_is_visible(ImageRelink(image)))
+
+    def test_japanese_retry_page_white_ps5_marker_rejects_plain_background(self):
+        image = Image.new("RGB", (1000, 1000), (40, 55, 80))
+        self.assertFalse(main.result_repeat_ps_button_is_visible(ImageRelink(image)))
+
+    def test_japanese_result_msp_marker_is_secondary_fallback(self):
+        class MspRelink(FakeRelink):
+            def screenshot(self):
+                return Image.new("RGB", (1163, 648), (0, 0, 0))
+
+            def ocr(self, image, confidence=0.35, language=None):
+                return [{"text": "獲得MSP 770"}]
+
+        self.assertTrue(main.result_msp_marker_is_visible(MspRelink(("ja",))))
+
+    def test_japanese_retry_page_requires_action_bar_before_msp_fallback(self):
+        relink = FakeRelink(("ja",))
+        with patch.object(
+            main, "result_repeat_control_is_visible", return_value=False
+        ), patch.object(
+            main, "result_repeat_ps_button_is_visible", return_value=True
+        ), patch.object(main, "result_msp_marker_is_visible", return_value=True):
+            self.assertFalse(main.japanese_retry_page_is_visible(relink))
+
+        with patch.object(
+            main, "result_repeat_control_is_visible", return_value=True
+        ), patch.object(
+            main, "result_repeat_ps_button_is_visible", return_value=False
+        ), patch.object(main, "result_msp_marker_is_visible", return_value=True):
+            self.assertTrue(main.japanese_retry_page_is_visible(relink))
+
+    def test_confirmed_japanese_repeat_sends_second_cross_only_when_still_on_retry_page(self):
+        relink = FakeRelink(("ja",))
+        with patch.object(main, "detect_stable_battle_hud", return_value=False), patch.object(
+            main, "japanese_settlement_highlight_dialog_active", return_value=False
+        ), patch.object(main, "japanese_retry_page_is_visible", return_value=True), patch.object(
+            main, "result_retry_state", return_value="enabled"
+        ), patch.object(main, "result_progress_prompt_is_visible", return_value=True
+        ), patch.object(main, "sleep"):
+            self.assertTrue(main.press_confirmed_repeat_continue(relink))
+        self.assertEqual([key for key, _ in relink.pressed], [main.CROSS_KEY, main.CROSS_KEY])
+
+    def test_confirmed_japanese_repeat_waits_for_the_shared_progress_prompt(self):
+        relink = FakeRelink(("ja",))
+        with patch.object(main, "result_progress_prompt_is_visible", return_value=False):
+            self.assertFalse(main.press_confirmed_repeat_continue(relink))
+        self.assertEqual(relink.pressed, [])
 
     def test_repeat_toggle_retries_once_when_available_state_remains_stable(self):
         relink = FakeRelink()
@@ -680,6 +1349,72 @@ class ReBattleRecoveryTests(unittest.TestCase):
 
         self.assertFalse(detected)
         self.assertEqual(details["candidates"], 0.0)
+
+    def test_ring_arc_experiment_accepts_occluded_gold_ring(self):
+        pixels = np.zeros((240, 320, 3), dtype=np.uint8)
+        image = Image.fromarray(pixels, mode="RGB")
+        # A visible left/bottom arc remains when the target body covers the
+        # rest of the lock ring.
+        ImageDraw.Draw(image).arc(
+            (105, 55, 215, 165),
+            start=115,
+            end=280,
+            fill=(255, 184, 42),
+            width=6,
+        )
+
+        detected, details = main.detect_l2_target_ring_arcs(np.asarray(image))
+
+        self.assertTrue(detected)
+        self.assertGreaterEqual(details["max_arc_run"], 5)
+
+    def test_ring_arc_experiment_rejects_broad_gold_flash(self):
+        pixels = np.zeros((240, 320, 3), dtype=np.uint8)
+        image = Image.fromarray(pixels, mode="RGB")
+        ImageDraw.Draw(image).ellipse(
+            (100, 45, 220, 165),
+            fill=(255, 184, 42),
+            outline=(255, 210, 80),
+            width=4,
+        )
+
+        detected, details = main.detect_l2_target_ring_arcs(np.asarray(image))
+
+        self.assertFalse(detected)
+        self.assertGreater(details["interior_gold"], 0.18)
+
+    def test_scheme7_uses_scheme6_guard_before_first_l2(self):
+        relink = FakeRelink()
+        clock = {"value": 0.0}
+        details = {
+            "score": 0.0,
+            "arc_sectors": 0.0,
+            "max_arc_run": 0.0,
+            "thinness": 0.0,
+            "interior_gold": 0.0,
+        }
+
+        def fake_time():
+            return clock["value"]
+
+        def fake_sleep(seconds):
+            clock["value"] += float(seconds)
+
+        def stop_after_l2(key, movement=None, interval=None):
+            relink.pressed.append((key, movement))
+            if key == main.L2_KEY:
+                relink.running = False
+
+        relink.press = stop_after_l2
+        with patch.object(main, "time", side_effect=fake_time), patch.object(
+            main, "sleep", side_effect=fake_sleep
+        ), patch.object(
+            main, "l2_target_ring_arc_snapshot", return_value=(False, details)
+        ), patch.object(main, "remote_sba_fill_fraction", return_value=0.0):
+            main.ring_arc_experiment_focus_watchdog(relink, lambda: True)
+
+        self.assertEqual([key for key, _ in relink.pressed], [main.L2_KEY])
+        self.assertGreaterEqual(clock["value"], 9.0)
 
     def test_boss_blue_bar_detector_accepts_horizontal_bar(self):
         pixels = np.zeros((240, 320, 3), dtype=np.uint8)

@@ -94,9 +94,6 @@ def build_command() -> list[str]:
         # ── 输出控制 ──
         "--standalone",
         "--onefile",
-        # Put the elevation request in the EXE manifest. This lets Windows
-        # handle UAC before Python starts and avoids a fragile second
-        # ``ShellExecuteW(runas)`` hop from a .cmd launcher.
         "--windows-uac-admin",
         f"--windows-icon-from-ico={ICON_FILE}",
         f"--output-dir={DIST_DIR}",

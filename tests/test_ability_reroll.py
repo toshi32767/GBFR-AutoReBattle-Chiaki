@@ -28,8 +28,10 @@ from module.ability_reroll import (
     total_stars,
 )
 from main import (
+    ABILITY_STAGE_DOUBLE_CHECK,
     _advance_ability_success_to_result,
     _ability_confirmation_ready,
+    _ability_language_marker_score,
     _ability_offer_ready,
     _ability_result_highlight,
     _ability_selected_level,
@@ -39,6 +41,7 @@ from main import (
     _config_bool,
     _load_ability_config,
     _move_ability_offer_to_lv3,
+    _read_ability_frame,
     ability_roll_display_name,
     play_ability_qualified_alert,
 )
@@ -49,6 +52,102 @@ def roll(name: str, stars: int, value: float, side: str = "new") -> AbilityRoll:
 
 
 class AbilityRerollTests(unittest.TestCase):
+    def test_only_final_overwrite_result_requires_a_second_full_ocr_pass(self):
+        self.assertEqual(ABILITY_STAGE_DOUBLE_CHECK, frozenset({"result"}))
+
+    def test_ability_language_marker_score_requires_exclusive_labels(self):
+        self.assertEqual(
+            _ability_language_marker_score(
+                [{"text": "上限突破 有几率不提升基础能力值 可获得的能力值"}], "zh"
+            ),
+            2,
+        )
+        self.assertEqual(
+            _ability_language_marker_score(
+                [{"text": "上限突破"}], "zh"
+            ),
+            0,
+        )
+
+    def test_ability_ocr_locks_auto_language_after_exclusive_marker(self):
+        class FakeRelink:
+            detected_ui_language = None
+
+            def __init__(self):
+                self.calls = []
+
+            def screenshot_text(self, _name):
+                return Image.new("RGB", (100, 100))
+
+            def ui_language_candidates(self):
+                return (self.detected_ui_language,) if self.detected_ui_language else ("zh", "ja")
+
+            def ocr(self, _frame, confidence, language):
+                self.calls.append(language)
+                if language == "zh":
+                    return [
+                        {"text": "有几率不提升基础能力值"},
+                        {"text": "可获得的能力值"},
+                        {"text": "暴击率+12%"},
+                        {"text": "昏厥值+20"},
+                        {"text": "普通攻击伤害上限+12%"},
+                        {"text": "奥义伤害上限+12%"},
+                    ]
+                return [{"text": "unrelated"}]
+
+            def confirm_ui_language(self, language, _evidence):
+                self.detected_ui_language = language
+
+        fake = FakeRelink()
+        _read_ability_frame(fake)
+        _read_ability_frame(fake)
+        self.assertEqual(fake.calls, ["zh", "ja", "zh"])
+
+    def test_locked_language_never_reopens_other_model_for_enhanced_fallback(self):
+        class FakeRelink:
+            detected_ui_language = "zh"
+
+            def __init__(self):
+                self.calls = []
+
+            def screenshot_text(self, _name):
+                return Image.new("RGB", (100, 100))
+
+            def ui_language_candidates(self):
+                return (self.detected_ui_language,)
+
+            def ocr(self, _frame, confidence, language):
+                self.calls.append(language)
+                return []
+
+        fake = FakeRelink()
+        _read_ability_frame(fake)
+        self.assertEqual(fake.calls, ["zh", "zh", "zh"])
+
+    def test_confirmation_markers_skip_enhanced_ocr_fallback(self):
+        class FakeRelink:
+            detected_ui_language = "zh"
+
+            def __init__(self):
+                self.calls = []
+
+            def screenshot_text(self, _name):
+                return Image.new("RGB", (100, 100))
+
+            def ui_language_candidates(self):
+                return (self.detected_ui_language,)
+
+            def ocr(self, _frame, confidence, language):
+                self.calls.append(language)
+                return [
+                    {"text": "当前能力值提升效果"},
+                    {"text": "执行"},
+                ]
+
+        fake = FakeRelink()
+        _read_ability_frame(fake)
+        self.assertEqual(fake.calls, ["zh"])
+
     def test_config_bool_does_not_treat_false_text_as_enabled(self):
         self.assertFalse(_config_bool("false"))
         self.assertFalse(_config_bool("0"))
@@ -328,7 +427,47 @@ class AbilityRerollTests(unittest.TestCase):
     def test_attribute_aliases_and_values(self):
         self.assertEqual(normalize_ability_name("奥义連锁伤害 +16%"), "奥义连锁伤害")
         self.assertEqual(normalize_ability_name("能力的 HP 回复上限 +20%"), "能力的HP回复上限")
+        japanese = {
+            "奥義の与ダメージ": "奥义伤害",
+            "通常攻撃のダメージ上限": "普通攻击伤害上限",
+            "アビリティのダメージ上限": "能力伤害上限",
+            "アビリティのHP回復上限": "能力的HP回复上限",
+            "チェインバーストの与ダメージ": "奥义连锁伤害",
+            "クリティカル確率": "暴击率",
+            "攻撃力": "攻击力",
+            "スタン値": "昏厥值",
+        }
+        for raw, canonical in japanese.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_ability_name(raw), canonical)
         self.assertEqual(parse_ability_value("HP +1600"), 1600.0)
+
+    def test_japanese_ability_stage_uses_the_same_state_machine(self):
+        confirmation_items = [
+            {"text": "限界突破", "location": (800, 240, 1020, 275)},
+            {"text": "現在の能力値上昇効果", "location": (700, 420, 1050, 455)},
+            {"text": "アビリティのダメージ上限+20%", "location": (480, 470, 700, 500)},
+            {"text": "攻撃力+500", "location": (1010, 470, 1220, 500)},
+            {"text": "実行", "location": (900, 800, 970, 830)},
+            {"text": "キャンセル", "location": (900, 850, 970, 880)},
+        ]
+        self.assertTrue(_ability_confirmation_ready(confirmation_items, None))
+        self.assertEqual(_ability_stage(confirmation_items, None), "confirmation")
+
+        result_items = [
+            {"text": "ステータス上書き確認", "location": (700, 220, 1020, 260)},
+            {"text": "現在の効果", "location": (400, 360, 700, 390)},
+            {"text": "新たに獲得したステータス", "location": (1100, 360, 1400, 390)},
+            {"text": "攻撃力+500", "location": (400, 500, 650, 530)},
+            {"text": "HP+1000", "location": (400, 580, 700, 610)},
+            {"text": "クリティカル確率+16%", "location": (400, 660, 700, 690)},
+            {"text": "スタン値+16", "location": (400, 740, 700, 770)},
+            {"text": "攻撃力+600", "location": (1100, 500, 1280, 530)},
+            {"text": "HP+1200", "location": (1100, 580, 1280, 610)},
+            {"text": "クリティカル確率+20%", "location": (1100, 660, 1280, 690)},
+            {"text": "スタン値+18", "location": (1100, 740, 1280, 770)},
+        ]
+        self.assertEqual(_ability_stage(result_items, None), "result")
 
     def test_thresholds_and_total_stars(self):
         values = [roll("暴击率", 10, 20), roll("能力伤害", 9, 20), roll("昏厥值", 8, 16), roll("HP", 9, 1600)]

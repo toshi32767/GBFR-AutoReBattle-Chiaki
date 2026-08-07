@@ -32,6 +32,236 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 
 
+# These names are deliberately user-facing rather than detector-specific.  A
+# Keep the recognition presets tied to Chiaki's four fixed 16:9 stream sizes.
+# Monitor/laptop physical sizes do not change the captured pixel geometry and
+# therefore must not select a different OCR policy.
+RECOGNITION_PROFILES: dict[str, dict[str, object]] = {
+    "auto": {"label": "自动适配（推荐）", "canvas": (1920, 1080)},
+    "chiaki_360p": {"label": "Chiaki 360p（640×360）", "canvas": (640, 360)},
+    "chiaki_540p": {"label": "Chiaki 540p（960×540）", "canvas": (960, 540)},
+    "chiaki_720p": {"label": "Chiaki 720p（1280×720）", "canvas": (1280, 720)},
+    "chiaki_1080p": {"label": "Chiaki 1080p", "canvas": (1920, 1080)},
+}
+
+
+def adjust_window_rect_ex(
+    rect: tuple[int, int, int, int],
+    style: int,
+    has_menu: bool,
+    ex_style: int,
+) -> tuple[int, int, int, int]:
+    """Call the Win32 API directly across pywin32 versions.
+
+    ``AdjustWindowRectEx`` is exposed by some pywin32 builds through
+    ``win32gui`` and absent from others.  The application only needs the
+    native RECT transformation, so use user32 directly instead of depending
+    on an optional wrapper attribute.
+    """
+
+    native_rect = wintypes.RECT(*[int(value) for value in rect])
+    api = ctypes.windll.user32.AdjustWindowRectEx
+    api.argtypes = [
+        ctypes.POINTER(wintypes.RECT),
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    api.restype = wintypes.BOOL
+    if not api(ctypes.byref(native_rect), int(style), bool(has_menu), int(ex_style)):
+        raise ctypes.WinError()
+    return (
+        native_rect.left,
+        native_rect.top,
+        native_rect.right,
+        native_rect.bottom,
+    )
+RECOGNITION_RESIZE_SETTLE_SECONDS = 0.9
+# OCR policy follows the selected recognition canvas. The profile is not only
+# a display label: low-resolution captures receive stronger text enlargement,
+# while 2K/4K captures stay bounded to avoid wasting OCR time on oversized
+# crops. Individual OCR regions may still request their own enhancement pass.
+RECOGNITION_OCR_POLICIES: dict[str, dict[str, object]] = {
+    "auto": {"min_scale": 1.0, "max_crop_pixels": 1600000},
+    "chiaki_360p": {"min_scale": 1.65, "max_crop_pixels": 900000},
+    "chiaki_540p": {"min_scale": 1.35, "max_crop_pixels": 1000000},
+    "chiaki_720p": {"min_scale": 1.15, "max_crop_pixels": 1200000},
+    "chiaki_1080p": {"min_scale": 1.0, "max_crop_pixels": 1600000},
+}
+
+
+def detect_game_content_bounds(frame: Image.Image) -> tuple[int, int, int, int, bool]:
+    """Return the visible game area, removing only confident black bars.
+
+    A 16:10 client is not automatically cropped: some Chiaki forks stretch
+    rather than letterbox.  We crop to the centred 16:9 candidate only when
+    the discarded edge bands are genuinely black, avoiding a silent loss of
+    game UI on unusual clients.
+    """
+
+    width, height = frame.size
+    if width < 16 or height < 16:
+        return 0, 0, width, height, False
+    ratio = width / max(1, height)
+    target = 16.0 / 9.0
+    if abs(ratio - target) <= 0.015:
+        return 0, 0, width, height, False
+    if ratio > target:
+        content_width = int(round(height * target))
+        x0 = max(0, (width - content_width) // 2)
+        candidate = (x0, 0, x0 + content_width, height)
+        strips = (frame.crop((0, 0, x0, height)), frame.crop((x0 + content_width, 0, width, height)))
+    else:
+        content_height = int(round(width / target))
+        y0 = max(0, (height - content_height) // 2)
+        candidate = (0, y0, width, y0 + content_height)
+        strips = (frame.crop((0, 0, width, y0)), frame.crop((0, y0 + content_height, width, height)))
+    samples = []
+    for strip in strips:
+        pixels = np.asarray(strip.convert("RGB"), dtype=np.uint8)
+        if pixels.size:
+            samples.append(float((pixels.max(axis=2) <= 24).mean()))
+    if samples and min(samples) >= 0.92:
+        x0, y0, x1, y1 = candidate
+        return x0, y0, x1 - x0, y1 - y0, True
+    return 0, 0, width, height, False
+
+
+def normalize_recognition_frame(
+    frame: Image.Image, profile: str = "auto"
+) -> tuple[Image.Image, dict[str, object]]:
+    """Crop black bars and scale without changing the image aspect ratio."""
+
+    chosen = profile if profile in RECOGNITION_PROFILES else "auto"
+    x, y, width, height, letterboxed = detect_game_content_bounds(frame)
+    content = frame.crop((x, y, x + width, y + height)).convert("RGB")
+    if chosen == "auto":
+        # The automatic mode must follow the actual Chiaki stream size.  A
+        # 540p full-frame ability screen has several columns and is expensive
+        # to detector-OCR; expanding it to 1080p before every pass turns a
+        # four-pixel workload into sixteen pixels without revealing new text.
+        # Narrow labels still receive their own OCR-only enlargement later.
+        if height <= 450:
+            canvas_width, canvas_height = (640, 360)
+            auto_canvas = "chiaki_360p"
+        elif height <= 630:
+            canvas_width, canvas_height = (960, 540)
+            auto_canvas = "chiaki_540p"
+        elif height <= 900:
+            canvas_width, canvas_height = (1280, 720)
+            auto_canvas = "chiaki_720p"
+        else:
+            canvas_width, canvas_height = (1920, 1080)
+            auto_canvas = "chiaki_1080p"
+    else:
+        canvas_width, canvas_height = RECOGNITION_PROFILES[chosen]["canvas"]
+        auto_canvas = chosen
+    # Fit to a fixed 16:9 canvas, preserving aspect ratio.  In automatic mode
+    # this is the nearest supported Chiaki rung; 4K is still bounded at 1080p.
+    scale = max(0.01, min(canvas_width / max(1, width), canvas_height / max(1, height)))
+    target = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    if content.size != target:
+        content = content.resize(target, getattr(Image, "Resampling", Image).LANCZOS)
+    return content, {
+        "profile": chosen,
+        "normalization_canvas": auto_canvas,
+        "source_size": frame.size,
+        "content_rect": (x, y, width, height),
+        "normalized_size": content.size,
+        "scale": round(scale, 5),
+        "letterbox_detected": letterboxed,
+    }
+
+
+def crop_normalized_relative_region(
+    frame: Image.Image, region: tuple[float, float, float, float]
+) -> Image.Image:
+    """Crop a normalized recognition frame from client-relative coordinates.
+
+    ``frame`` has already had window chrome removed and has been normalized to
+    the selected Chiaki recognition canvas.  Applying text regions here keeps
+    foreground and background capture in the same coordinate system.  In
+    particular, background HWND capture must not map a client frame through
+    the larger title-bar-inclusive window rectangle a second time.
+    """
+    left, top, right, bottom = region
+    x0 = int(round(frame.width * min(1.0, max(0.0, left))))
+    y0 = int(round(frame.height * min(1.0, max(0.0, top))))
+    x1 = int(round(frame.width * min(1.0, max(0.0, right))))
+    y1 = int(round(frame.height * min(1.0, max(0.0, bottom))))
+    return frame.crop(
+        (
+            min(x0, max(0, frame.width - 1)),
+            min(y0, max(0, frame.height - 1)),
+            max(x0 + 1, min(frame.width, x1)),
+            max(y0 + 1, min(frame.height, y1)),
+        )
+    )
+
+
+def crop_window_capture_to_client_area(
+    frame: Image.Image,
+    window_rect: tuple[int, int, int, int],
+    client_rect: tuple[int, int, int, int],
+) -> Image.Image:
+    """Remove HWND non-client pixels from a Windows Graphics Capture frame."""
+    outer_left, outer_top, outer_right, outer_bottom = window_rect
+    client_left, client_top, client_right, client_bottom = client_rect
+    outer_width = outer_right - outer_left
+    outer_height = outer_bottom - outer_top
+    if outer_width <= 0 or outer_height <= 0 or frame.width < 2 or frame.height < 2:
+        return frame
+    scale_x = frame.width / outer_width
+    scale_y = frame.height / outer_height
+    # A client-only capture has a different vertical scale when the window has
+    # a title bar. Do not crop it a second time.
+    if abs(scale_x - scale_y) > 0.03:
+        return frame
+    x0 = int(round((client_left - outer_left) * scale_x))
+    y0 = int(round((client_top - outer_top) * scale_y))
+    x1 = int(round((client_right - outer_left) * scale_x))
+    y1 = int(round((client_bottom - outer_top) * scale_y))
+    if x0 < 0 or y0 < 0 or x1 > frame.width or y1 > frame.height or x1 <= x0 or y1 <= y0:
+        return frame
+    return frame.crop((x0, y0, x1, y1))
+
+
+def prepare_ocr_image(pic: Image.Image, profile: str = "auto") -> Image.Image:
+    """Upscale small OCR crops without enlarging already-normalized frames.
+
+    The recognition canvas normalizes the full stream geometry, but narrow
+    labels can still be only a few dozen pixels tall when the Chiaki window is
+    small. OCR benefits from more input pixels even though the underlying
+    information is unchanged. This helper is used only by text OCR; pixel
+    detectors and coordinate-bearing full-frame ability parsing keep their
+    original images.
+    """
+    if not isinstance(pic, Image.Image):
+        return pic
+    width, height = pic.size
+    # Full-frame OCR and large menu crops carry coordinates consumed by some
+    # parsers. Keep them unchanged; narrow strips are the cases where text
+    # height, rather than screen geometry, is the limiting factor.
+    if min(width, height) >= 500:
+        return pic
+    largest = max(width, height)
+    scale = 3 if largest < 500 else 2
+    policy = RECOGNITION_OCR_POLICIES.get(profile, RECOGNITION_OCR_POLICIES["auto"])
+    scale = max(scale, float(policy["min_scale"]))
+    max_crop_pixels = int(policy["max_crop_pixels"])
+    if width * height * scale * scale > max_crop_pixels:
+        scale = min(scale, (max_crop_pixels / max(1, width * height)) ** 0.5)
+    scale = max(1.0, scale)
+    # PIL requires integral output dimensions. The pixel-budget branch above
+    # intentionally produces a fractional scale for many rectangular OCR
+    # crops (for example a 900x400 panel under a 1M-pixel budget). Truncate
+    # after scaling so we also retain the promised maximum-pixel bound.
+    target_width = max(1, int(width * scale))
+    target_height = max(1, int(height * scale))
+    resampling = getattr(Image, "Resampling", Image).LANCZOS
+    return pic.resize((target_width, target_height), resampling)
+
+
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [
         ("dx", wintypes.LONG),
@@ -103,6 +333,7 @@ class Controller:
         expected_process_id=None,
         allow_missing_window=False,
         ui_language="auto",
+        recognition_profile="auto",
     ) -> None:
         self.run_as_admin()
 
@@ -110,6 +341,12 @@ class Controller:
         self._target_hwnd: int | None = None
         self.window_rect = None
         self.text2region = region_dict
+        self.recognition_profile = (
+            recognition_profile if recognition_profile in RECOGNITION_PROFILES else "auto"
+        )
+        self.geometry_generation = 0
+        self._geometry_changed_at = 0.0
+        self._last_geometry_signature = None
         self.project_name = project_name
         self.background_mode = bool(background)
         # Some ViGEm/driver/game combinations report the DS4 Y axis with the
@@ -497,33 +734,30 @@ class Controller:
 
 
     def screenshot_text(self, text):
-        if self.window_rect is None:
-            try:
-                rect = self.get_window_rect(silent=True)
-            except TypeError:
-                if not self.background_mode:
-                    self.focus_window()
-                rect = self.get_window_rect(silent=True)
-            if rect is None:
-                raise RuntimeError("Chiaki 串流窗口暂时不可用")
-            left, top, width, height = rect
-        else:
-            left, top, width, height = self.window_rect
         if self.text2region is None or text not in self.text2region.keys():
-            img = self.screenshot(region=(left, top, width, height))
-        else:
-            x1 = int(left + width * self.text2region[text][0])
-            y1 = int(top + height * self.text2region[text][1])
-            width1 = int(
-                width * (self.text2region[text][2] - self.text2region[text][0])
-            )
-            height1 = int(
-                height * (self.text2region[text][3] - self.text2region[text][1])
-            )
-            region = (x1, y1, width1, height1)
-            img = self.screenshot(region=region)
+            return self.screenshot()
+        return crop_normalized_relative_region(
+            self.screenshot(), self.text2region[text]
+        )
 
-        return img
+    def recognition_geometry_state(self) -> dict[str, object]:
+        """Return the current capture geometry for diagnostics and DEBUG logs."""
+        rect = self.window_rect
+        return {
+            "actual_window_rect": rect,
+            "actual_client_size": None if rect is None else tuple(rect[2:]),
+            "selected_profile": self.recognition_profile,
+            "geometry_generation": self.geometry_generation,
+            "resize_settling": (
+                bool(self._geometry_changed_at)
+                and monotonic() - self._geometry_changed_at < RECOGNITION_RESIZE_SETTLE_SECONDS
+            ),
+        }
+
+    def recognition_resize_settling(self) -> bool:
+        """Avoid input while Chiaki is between two client-area sizes."""
+        changed_at = getattr(self, "_geometry_changed_at", 0.0)
+        return bool(changed_at) and monotonic() - changed_at < RECOGNITION_RESIZE_SETTLE_SECONDS
 
     def screenshot(
         self, region: tuple[int, int, int, int] | None = None
@@ -546,11 +780,6 @@ class Controller:
             _log.warning("Chiaki stream window is minimized; restore it before starting")
             self.focus_window()
 
-        left, top, width, height = self.window_rect
-        if region is None:
-            region = (left, top, width, height)
-        r_left, r_top, r_w, r_h = region
-
         if self.background_mode:
             with self._capture_lock:
                 # The callback assigns a new immutable NumPy array; retaining
@@ -561,21 +790,52 @@ class Controller:
             if pixels.ndim != 3 or pixels.shape[2] < 3:
                 raise RuntimeError("后台窗口捕获返回了无效画面")
 
-            frame_h, frame_w = pixels.shape[:2]
-            scale_x = frame_w / max(1, width)
-            scale_y = frame_h / max(1, height)
-            x0 = max(0, min(frame_w, int((r_left - left) * scale_x)))
-            y0 = max(0, min(frame_h, int((r_top - top) * scale_y)))
-            x1 = max(x0 + 1, min(frame_w, int((r_left - left + r_w) * scale_x)))
-            y1 = max(y0 + 1, min(frame_h, int((r_top - top + r_h) * scale_y)))
             # Windows Graphics Capture returns BGRA; RapidOCR receives RGB.
-            crop = pixels[y0:y1, x0:x1, :3][:, :, ::-1].copy()
-            return Image.fromarray(crop, mode="RGB")
+            full_frame = Image.fromarray(pixels[:, :, :3][:, :, ::-1].copy(), mode="RGB")
+            full_frame = self._background_capture_client_frame(full_frame)
+        else:
+            left, top, width, height = self.window_rect
+            full_frame = ImageGrab.grab(
+                bbox=(left, top, left + width, top + height),
+                all_screens=True,
+            ).convert("RGB")
 
-        return ImageGrab.grab(
-            bbox=(r_left, r_top, r_left + r_w, r_top + r_h),
-            all_screens=True,
-        ).convert("RGB")
+        normalized, metadata = normalize_recognition_frame(
+            full_frame, self.recognition_profile
+        )
+        self._last_recognition_metadata = metadata
+        if region is None:
+            return normalized
+        left, top, width, height = self.window_rect
+        r_left, r_top, r_w, r_h = region
+        x0 = int(normalized.width * max(0.0, (r_left - left) / max(1, width)))
+        y0 = int(normalized.height * max(0.0, (r_top - top) / max(1, height)))
+        x1 = int(normalized.width * min(1.0, (r_left - left + r_w) / max(1, width)))
+        y1 = int(normalized.height * min(1.0, (r_top - top + r_h) / max(1, height)))
+        return normalized.crop((x0, y0, max(x0 + 1, x1), max(y0 + 1, y1)))
+
+    def _background_capture_client_frame(self, frame: Image.Image) -> Image.Image:
+        """Align a HWND capture with the client coordinates used elsewhere."""
+        hwnd = self._get_hwnd()
+        if hwnd is None:
+            return frame
+        try:
+            outer = win32gui.GetWindowRect(hwnd)
+            client_left, client_top = win32gui.ClientToScreen(hwnd, (0, 0))
+            client_right, client_bottom = win32gui.ClientToScreen(
+                hwnd, win32gui.GetClientRect(hwnd)[2:]
+            )
+            cropped = crop_window_capture_to_client_area(
+                frame,
+                tuple(int(value) for value in outer),
+                (client_left, client_top, client_right, client_bottom),
+            )
+            if cropped.size != frame.size:
+                _log.debug("后台窗口捕获已裁切客户区 | 原始=%s | 客户区=%s", frame.size, cropped.size)
+            return cropped
+        except Exception:
+            _log.debug("后台窗口捕获客户区裁切失败，保留原始帧", exc_info=True)
+            return frame
 
     def get_window_rect(self, silent: bool = False):
         hwnd = self._get_hwnd()
@@ -604,8 +864,61 @@ class Controller:
         right, bottom = win32gui.ClientToScreen(hwnd, (c_right, c_bottom))
         width = right - left
         height = bottom - top
-        self.window_rect = (left, top, width, height)
-        return (left, top, width, height)
+        new_rect = (left, top, width, height)
+        previous_rect = self.window_rect
+        previous_size = None if previous_rect is None else tuple(previous_rect[2:])
+        current_size = (width, height)
+        # Moving Chiaki changes the screen-space origin but does not change
+        # the normalized recognition canvas. Do not refresh the settling
+        # fence for position-only changes.
+        size_changed = previous_size is not None and previous_size != current_size
+        first_geometry = previous_rect is None
+        if new_rect != previous_rect:
+            self.geometry_generation += 1
+            if size_changed:
+                self._geometry_changed_at = monotonic()
+                _log.info(
+                    "Chiaki 客户区尺寸变化 | %s -> %s | 识别暂停 %.1f 秒后恢复",
+                    previous_size,
+                    current_size,
+                    RECOGNITION_RESIZE_SETTLE_SECONDS,
+                )
+            elif first_geometry:
+                _log.debug("Chiaki 客户区已绑定 | 尺寸=%s | 位置=(%s,%s)", current_size, left, top)
+            else:
+                _log.debug("Chiaki 客户区位置变化 | %s -> (%s,%s) | 尺寸保持=%s", tuple(previous_rect[:2]), left, top, current_size)
+        self.window_rect = new_rect
+        return new_rect
+
+    def resize_client_area(self, width: int, height: int) -> bool:
+        """Resize the bound Chiaki client area while keeping its screen position."""
+        if width <= 0 or height <= 0:
+            raise ValueError("Chiaki 客户区尺寸必须为正数")
+        hwnd = self._get_hwnd()
+        if hwnd is None or win32gui.IsIconic(hwnd):
+            return False
+        window_rect = win32gui.GetWindowRect(hwnd)
+        client_left, client_top = win32gui.ClientToScreen(hwnd, (0, 0))
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        adjusted = adjust_window_rect_ex(
+            (0, 0, int(width), int(height)), style, False, ex_style
+        )
+        outer_width = adjusted[2] - adjusted[0]
+        outer_height = adjusted[3] - adjusted[1]
+        outer_left = client_left + adjusted[0]
+        outer_top = client_top + adjusted[1]
+        flags = win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
+        win32gui.SetWindowPos(
+            hwnd, 0, outer_left, outer_top, outer_width, outer_height, flags
+        )
+        self.window_rect = None
+        self.get_window_rect(silent=True)
+        _log.info(
+            "Chiaki 客户区已恢复为 %sx%s（窗口外框 %sx%s，原窗口 %s）",
+            width, height, outer_width, outer_height, window_rect,
+        )
+        return self.window_rect is not None and self.window_rect[2:] == (width, height)
 
     def _rect_watchdog(self, interval: float = 0.5) -> None:
         """后台线程：周期性刷新窗口客户区矩形，窗口移动/缩放时保持最新"""
@@ -1528,6 +1841,12 @@ class Controller:
     def ocr(self, pic: Image, confidence=0.6, language: str | None = None):
         # RapidOCR can be called by multiple phase checks. Serialize inference
         # so concurrent frame checks cannot corrupt or stall the ONNX session.
+        source_size = getattr(pic, "size", None)
+        pic = prepare_ocr_image(pic, self.recognition_profile)
+        source_width, source_height = source_size or pic.size
+        prepared_width, prepared_height = pic.size
+        coordinate_scale_x = source_width / max(1, prepared_width)
+        coordinate_scale_y = source_height / max(1, prepared_height)
         model, selected_language = self._ocr_model_for(language)
         with self._ocr_lock:
             result = model(pic, use_det=True, use_cls=False)
@@ -1542,10 +1861,10 @@ class Controller:
                 d = {
                     "text": item[1],
                     "location": (
-                        int(item[0][0][0]) - 1,
-                        int(item[0][0][1]) - 1,
-                        int(item[0][2][0]) + 1,
-                        int(item[0][2][1]) + 1,
+                        max(0, int(item[0][0][0] * coordinate_scale_x) - 1),
+                        max(0, int(item[0][0][1] * coordinate_scale_y) - 1),
+                        min(source_width, int(item[0][2][0] * coordinate_scale_x) + 1),
+                        min(source_height, int(item[0][2][1] * coordinate_scale_y) + 1),
                     ),
                 }
                 ocr_result_list.append(d)
@@ -1572,6 +1891,7 @@ class Controller:
         expensive text detector while retaining OCR tolerance for resolution
         and stream-compression changes.
         """
+        pic = prepare_ocr_image(pic, self.recognition_profile)
         model, selected_language = self._ocr_model_for(language)
         with self._ocr_lock:
             result = model(pic, use_det=False, use_cls=False)
@@ -1983,6 +2303,13 @@ class Controller:
         # A release must always be allowed so pausing or a phase transition can
         # neutralize a key that was pressed just before the state changed.
         if self._paused and movement != "release":
+            return False
+        # Resizing Chiaki changes both the capture buffer and the desktop
+        # coordinate mapping. The screenshot path adapts immediately, but a
+        # short input fence prevents a pulse from landing on the transition
+        # frame in either foreground or background mode.
+        if movement != "release" and self.recognition_resize_settling():
+            _log.debug("Chiaki 尺寸仍在变化，暂缓输入: '%s'", key)
             return False
 
         normalized = key.lower()
