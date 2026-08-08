@@ -1,0 +1,98 @@
+name: Build and publish Windows package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create or update
+        required: true
+        default: v0.1.0
+      prerelease:
+        description: Mark the GitHub Release as a prerelease
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: python -m pip install --upgrade pip; python -m pip install -r requirements-dev.txt
+
+      - name: Verify source tree
+        shell: pwsh
+        run: .\scripts\verify_publish_tree.ps1
+
+      - name: Compile source
+        shell: pwsh
+        run: python -m py_compile main.py module\controller.py module\log.py module\psn_account.py module\utils.py
+
+      - name: Build PyInstaller runtime
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean `
+            --distpath dist-pyinstaller-release `
+            --workpath build-pyinstaller-release `
+            build-pyinstaller\GBFR_AutoReBattle.spec
+
+      - name: Assemble complete user package
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "GBFR-AutoReBattle-Chiaki-$env:RELEASE_TAG"
+          $app = Join-Path $stage "GBFR_AutoReBattle"
+          New-Item -ItemType Directory -Path $app -Force | Out-Null
+          Copy-Item -Path "dist-pyinstaller-release\GBFR_AutoReBattle\*" -Destination $app -Recurse -Force
+          Get-ChildItem -LiteralPath . -Filter "*.cmd" -File | Copy-Item -Destination $stage -Force
+          Copy-Item -LiteralPath "README.md", "README.en.md", "README_使用说明.md", "NOTICE.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md", "RELEASE_NOTICES.md" -Destination $stage -Force
+          $zip = Join-Path $env:GITHUB_WORKSPACE "GBFR-AutoReBattle-Chiaki-$env:RELEASE_TAG-Windows.zip"
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
+          "PACKAGE=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-Item -LiteralPath $zip | Select-Object FullName, Length
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GBFR-AutoReBattle-Chiaki-${{ inputs.tag }}-Windows
+          path: ${{ env.PACKAGE }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release and upload package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          GBFR AutoReBattle - Chiaki Windows $env:RELEASE_TAG
+
+          This package contains the GBFR AutoReBattle runtime and OCR models.
+          Chiaki itself is not bundled; follow README_使用说明.md before first use.
+
+          Recommended resolution: 720p or higher. 360p/540p may have poorer OCR stability.
+          "@
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          Set-Content -LiteralPath $notesPath -Value $notes -Encoding utf8
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG $env:PACKAGE --clobber
+          } else {
+            $pre = if ('${{ inputs.prerelease }}' -eq 'true') { '--prerelease' } else { '' }
+            gh release create $env:RELEASE_TAG $env:PACKAGE --title "GBFR AutoReBattle - Chiaki $env:RELEASE_TAG" --notes-file $notesPath $pre
+          }
