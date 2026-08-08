@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Source repository documentation: replaced the short README with a complete
+  private-source guide covering download/package layout, first-run setup,
+  foreground/background operation, language and resolution choices, ability
+  reroll, troubleshooting, development entry points, and safe customization.
+  The source remains private and excludes release archives, Chiaki binaries,
+  logs, screenshots, and local runtime data.
 - V131：重新以完整便携包模板制作 Windows 发行包，包含 Chiaki、驱动安装入口、全部启动脚本、说明文档和 V129 的主程序/依赖；不再沿用 V129 仅含程序目录的归档方式。
 - V130：修正 V129 的发行归档范围。Windows 完整包重新包含便携 Chiaki、全部启动脚本、说明文档和自动化依赖；主程序及 `_internal` 使用 V129 的能力提升 OCR 性能优化构建。V129 不完整归档保留，仅用于追溯，不应下载测试。
 - V129：能力提升重抽改为独立快速识别路径。界面语言锁定后只使用对应 OCR 模型；候选页、执行确认页、成功页在结构完整时不再重复全屏 OCR，执行确认页的“当前效果 + 执行”标记不再误触发增强图回退。最终覆盖结果和自动覆盖“是”高亮仍保留二次复核。能力提升状态机不再调用日文战斗结算高亮检测，避免额外 OCR 与跨流程输入干扰。
