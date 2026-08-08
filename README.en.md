@@ -27,9 +27,11 @@ the main panel.
 6. Click `启动自动重战`. `F2` stops immediately and `F3` pauses/resumes.
 
 Keep the Chiaki stream connected, visible, non-minimized, and at a 16:9 aspect
-ratio. Supported resolution presets are 360p, 540p, 720p, and 1080p. After
-resizing Chiaki, recapture the stream window or pause briefly so the client
-area can be recalculated.
+ratio. Supported resolution presets are 360p, 540p, 720p, and 1080p. OCR
+stability and the user experience can be poor at 360p/540p because streamed
+text is small and compression artifacts are stronger. 720p or higher is
+recommended for unattended use. After resizing Chiaki, recapture the stream
+window or pause briefly so the client area can be recalculated.
 
 ## Features
 
@@ -79,8 +81,9 @@ logs, screenshots, PSN data, or local driver installers.
 
 ## Legal and distribution notice
 
-The derivative source currently has no public license grant. Keep the
-repository private unless the rights holder provides permission. Before any
-public release, read `PUBLISH_BLOCKERS.md`, `NOTICE.md`,
-`CORRESPONDING_SOURCE.md`, and `THIRD_PARTY_NOTICES.md`, including the separate
-Chiaki and OCR redistribution requirements.
+This project does not grant additional rights to third-party components. Any
+use, modification, or redistribution must follow the applicable project,
+Chiaki, RapidOCR, OCR model, and dependency notices. Read `NOTICE.md`,
+`SECURITY.md`, `PUBLISH_BLOCKERS.md`, and `THIRD_PARTY_NOTICES.md` before
+redistributing binaries. The tool is not guaranteed to work with every
+resolution, Chiaki build, or game-client configuration.

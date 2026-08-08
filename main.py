@@ -136,6 +136,92 @@ UI_LANGUAGE_LABELS = {
     "zh": "简体中文",
     "ja": "日文",
 }
+APP_LANGUAGE_LABELS = {
+    "zh": "简体中文",
+    "ja": "日本語",
+    "en": "English",
+}
+GAME_LANGUAGE_LABELS = {
+    "zh": {"auto": "自动识别", "zh": "简体中文", "ja": "日文"},
+    "ja": {"auto": "自動判定", "zh": "簡体字中国語", "ja": "日本語"},
+    "en": {"auto": "Auto detect", "zh": "Simplified Chinese", "ja": "Japanese"},
+}
+APP_TRANSLATIONS = {
+    "ja": {
+        "GBFR 自动重战": "GBFR 自動再戦",
+        "工具界面语言": "ツール表示言語",
+        "应用界面": "適用",
+        "Chiaki 程序": "Chiaki プログラム",
+        "浏览": "参照",
+        "自动查找": "自動検索",
+        "启动 Chiaki": "Chiaki を起動",
+        "串流窗口标题": "ストリームウィンドウタイトル",
+        "应用标题": "タイトルを適用",
+        "捕获当前标题": "現在のタイトルを取得",
+        "一键同步输入配置": "入力設定を同期",
+        "游戏界面语言": "ゲーム表示言語",
+        "应用语言": "ゲーム言語を適用",
+        "识别画面档位": "認識解像度",
+        "恢复 Chiaki 画面": "Chiaki 解像度を復元",
+        "战斗索敌方案": "戦闘ターゲット検索方式",
+        "索敌方案": "ターゲット検索方式",
+        "应用索敌方案": "検索方式を適用",
+        "检查后台环境": "バックグラウンド環境を確認",
+        "安装 ViGEmBus": "ViGEmBus をインストール",
+        "安装 HidHide": "HidHide をインストール",
+        "启动自动重战": "自動再戦を開始",
+        "暂停/继续（F3）": "一時停止/再開 (F3)",
+        "一键重连并挂机": "再接続して放置開始",
+        "获取 PSN AccountID": "PSN AccountID を取得",
+        "停止并关闭 Chiaki": "停止して Chiaki を終了",
+        "打开日志目录": "ログフォルダーを開く",
+        "设置…": "設定…",
+        "能力提升重抽…": "能力強化リロール…",
+        "查看词条记录": "能力記録を表示",
+        "串流卡死恢复（配置会保存在本机）": "ストリーム停止時の復旧 (設定はこのPCに保存)",
+        "自动结束设置（点击“应用设置”后生效，运行中修改也会生效）": "自動終了設定 (適用後に有効)",
+        "本轮挂机统计": "今回の放置統計",
+        "运行日志（暂停自动滚动后可拖动右侧滚动条查看历史）": "実行ログ (自動スクロールを一時停止して履歴を確認)",
+        "查看最新日志": "最新ログを表示",
+    },
+    "en": {
+        "GBFR 自动重战": "GBFR Auto ReBattle",
+        "工具界面语言": "Tool UI language",
+        "应用界面": "Apply",
+        "Chiaki 程序": "Chiaki program",
+        "浏览": "Browse",
+        "自动查找": "Find automatically",
+        "启动 Chiaki": "Start Chiaki",
+        "串流窗口标题": "Stream window title",
+        "应用标题": "Apply title",
+        "捕获当前标题": "Capture current title",
+        "一键同步输入配置": "Sync input settings",
+        "游戏界面语言": "Game language",
+        "应用语言": "Apply game language",
+        "识别画面档位": "Recognition resolution",
+        "恢复 Chiaki 画面": "Restore Chiaki resolution",
+        "战斗索敌方案": "Battle targeting strategy",
+        "索敌方案": "Targeting strategy",
+        "应用索敌方案": "Apply strategy",
+        "检查后台环境": "Check background environment",
+        "安装 ViGEmBus": "Install ViGEmBus",
+        "安装 HidHide": "Install HidHide",
+        "启动自动重战": "Start Auto ReBattle",
+        "暂停/继续（F3）": "Pause/Resume (F3)",
+        "一键重连并挂机": "Reconnect and start",
+        "获取 PSN AccountID": "Get PSN AccountID",
+        "停止并关闭 Chiaki": "Stop and close Chiaki",
+        "打开日志目录": "Open log folder",
+        "设置…": "Settings…",
+        "能力提升重抽…": "Ability reroll…",
+        "查看词条记录": "View ability journal",
+        "串流卡死恢复（配置会保存在本机）": "Stream recovery (saved locally)",
+        "自动结束设置（点击“应用设置”后生效，运行中修改也会生效）": "Automatic stop settings",
+        "本轮挂机统计": "Session statistics",
+        "运行日志（暂停自动滚动后可拖动右侧滚动条查看历史）": "Runtime log (pause scrolling to inspect history)",
+        "查看最新日志": "Show latest log",
+    },
+}
 UI_MARKERS = {
     "zh": {
         "battle_hud": ("跳跃",),
@@ -8257,11 +8343,33 @@ def run_unified_gui(args) -> int:
     ):
         saved_window_title = CHIAKI_WINDOW_TITLE
     title_var = tk.StringVar(value=saved_window_title)
+    saved_app_language = str(saved_settings.get("app_language", "zh")).strip().lower()
+    if saved_app_language not in APP_LANGUAGE_LABELS:
+        saved_app_language = "zh"
+    app_language_var = tk.StringVar(value=APP_LANGUAGE_LABELS[saved_app_language])
+    app_language_label_to_code = {
+        label: code for code, label in APP_LANGUAGE_LABELS.items()
+    }
     saved_language = str(saved_settings.get("ui_language", args.ui_language)).strip().lower()
     if saved_language not in UI_LANGUAGE_LABELS:
         saved_language = "auto"
-    language_label_to_code = {label: code for code, label in UI_LANGUAGE_LABELS.items()}
-    ui_language_var = tk.StringVar(value=UI_LANGUAGE_LABELS[saved_language])
+    game_language_label_to_code = {}
+    ui_language_var = tk.StringVar()
+    language_combo_holder: dict[str, ttk.Combobox | None] = {"value": None}
+
+    def selected_game_language_code() -> str:
+        return game_language_label_to_code.get(ui_language_var.get(), "auto")
+
+    def set_game_language_labels(app_code: str) -> None:
+        nonlocal game_language_label_to_code
+        labels = GAME_LANGUAGE_LABELS.get(app_code, GAME_LANGUAGE_LABELS["zh"])
+        game_language_label_to_code = {label: code for code, label in labels.items()}
+        ui_language_var.set(labels.get(saved_language, labels["auto"]))
+        language_combo_widget = language_combo_holder["value"]
+        if language_combo_widget is not None:
+            language_combo_widget.configure(values=tuple(labels.values()))
+
+    set_game_language_labels(saved_app_language)
     recognition_profile_var = tk.StringVar(
         value=str(saved_settings.get("recognition_profile", "auto"))
     )
@@ -8812,12 +8920,13 @@ def run_unified_gui(args) -> int:
     def save_background_choice() -> None:
         """Persist only the selected mode; environment checks never alter it."""
         settings = load_gui_settings()
+        settings["app_language"] = app_language_label_to_code.get(
+            app_language_var.get(), "zh"
+        )
         settings["background_mode"] = bool(background.get())
         settings["invert_movement"] = bool(invert_movement.get())
         settings["window_title"] = title_var.get().strip()
-        settings["ui_language"] = language_label_to_code.get(
-            ui_language_var.get(), "auto"
-        )
+        settings["ui_language"] = selected_game_language_code()
         settings["recognition_profile"] = selected_recognition_profile_code()
         settings["chiaki_exe"] = path_var.get().strip()
         settings["auto_recover"] = bool(auto_recover.get())
@@ -8852,16 +8961,58 @@ def run_unified_gui(args) -> int:
         )
 
     def apply_ui_language() -> None:
-        """Persist the language selection and make its effect explicit."""
-        code = language_label_to_code.get(ui_language_var.get(), "auto")
+        """Persist the game OCR language selection and make it explicit."""
+        code = selected_game_language_code()
         save_background_choice()
         process = automation_process["value"]
         if process is not None and process.poll() is None:
             set_status(
-                f"界面语言已应用：{UI_LANGUAGE_LABELS[code]}；请停止并重新启动自动重战后生效"
+                f"游戏识别语言已应用：{UI_LANGUAGE_LABELS[code]}；请停止并重新启动自动重战后生效"
             )
         else:
-            set_status(f"界面语言已应用：{UI_LANGUAGE_LABELS[code]}")
+            set_status(f"游戏识别语言已应用：{UI_LANGUAGE_LABELS[code]}")
+
+    def apply_display_language() -> None:
+        """Apply translations to the visible control panel without changing OCR."""
+        code = app_language_label_to_code.get(app_language_var.get(), "zh")
+        settings = load_gui_settings()
+        settings["app_language"] = code
+        try:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = settings_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(temporary, settings_path)
+        except OSError as exc:
+            set_status(f"无法保存工具界面语言：{exc}")
+            return
+        set_game_language_labels(code)
+        translation = APP_TRANSLATIONS.get(code, {})
+
+        def translate_tree(widget: tk.Misc) -> None:
+            for child in widget.winfo_children():
+                if isinstance(child, (tk.LabelFrame, tk.Label, tk.Button)):
+                    if not str(child.cget("textvariable")):
+                        source = getattr(child, "_gbfr_i18n_source", None)
+                        if source is None:
+                            source = str(child.cget("text"))
+                            setattr(child, "_gbfr_i18n_source", source)
+                        if source in translation:
+                            child.configure(text=translation[source])
+                translate_tree(child)
+
+        translate_tree(root)
+        root.title(
+            "GBFR Auto ReBattle · Chiaki Console"
+            if code == "en"
+            else "GBFR 自動再戦 · Chiaki コンソール"
+            if code == "ja"
+            else "GBFR 自动重战 · Chiaki 控制台"
+        )
+        set_status(
+            {"zh": "工具界面语言已应用：简体中文", "ja": "ツール表示言語を適用しました", "en": "Tool UI language applied"}[code]
+        )
 
     def restore_chiaki_resolution(profile: str) -> None:
         """Restore one of the supported 16:9 Chiaki client-area presets."""
@@ -9577,7 +9728,7 @@ def run_unified_gui(args) -> int:
         command.extend(
             (
                 "--ui-language",
-                language_label_to_code.get(ui_language_var.get(), "auto"),
+                selected_game_language_code(),
             )
         )
         command.extend(("--recognition-profile", selected_recognition_profile_code()))
@@ -9704,7 +9855,7 @@ def run_unified_gui(args) -> int:
                 "--window-title",
                 title_var.get(),
                 "--ui-language",
-                language_label_to_code.get(ui_language_var.get(), "auto"),
+                selected_game_language_code(),
                 "--recognition-profile",
                 selected_recognition_profile_code(),
                 "--ability-config-file",
@@ -10922,10 +11073,11 @@ def run_unified_gui(args) -> int:
     language_combo = ttk.Combobox(
         language_frame,
         textvariable=ui_language_var,
-        values=tuple(UI_LANGUAGE_LABELS.values()),
+        values=tuple(GAME_LANGUAGE_LABELS[saved_app_language].values()),
         state="readonly",
         width=14,
     )
+    language_combo_holder["value"] = language_combo
     language_combo.grid(row=0, column=1, sticky="w")
     tk.Button(language_frame, text="应用语言", command=apply_ui_language, width=12).grid(
         row=0, column=2, padx=(8, 0), sticky="w"
@@ -11198,7 +11350,24 @@ def run_unified_gui(args) -> int:
         text="GBFR 自动重战",
         font=("Segoe UI Semibold", 13),
         anchor="w",
-    ).grid(row=0, column=0, columnspan=3, padx=12, pady=(12, 2), sticky="w")
+    ).grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 2), sticky="w")
+    display_language_frame = tk.Frame(root)
+    display_language_frame.grid(row=0, column=2, padx=12, pady=(8, 2), sticky="e")
+    tk.Label(display_language_frame, text="工具界面语言").pack(side="left", padx=(0, 5))
+    display_language_combo = ttk.Combobox(
+        display_language_frame,
+        textvariable=app_language_var,
+        values=tuple(APP_LANGUAGE_LABELS.values()),
+        state="readonly",
+        width=10,
+    )
+    display_language_combo.pack(side="left")
+    tk.Button(
+        display_language_frame,
+        text="应用界面",
+        command=apply_display_language,
+        width=8,
+    ).pack(side="left", padx=(5, 0))
     path_frame.grid_configure(row=1, column=1, padx=8, pady=(4, 5), sticky="ew")
     path_frame.grid()
     start_chiaki_button.grid_configure(row=1, column=2, padx=12, pady=(4, 5), sticky="e")
@@ -11330,6 +11499,8 @@ def run_unified_gui(args) -> int:
             apply_theme(child, child_bg)
 
     apply_theme(root, palette["surface"])
+    if saved_app_language != "zh":
+        apply_display_language()
     set_automation_state(
         automation_state.get(), str(automation_state_current["tone"])
     )

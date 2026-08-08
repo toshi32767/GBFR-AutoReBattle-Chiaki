@@ -13,10 +13,10 @@ Windows 工具，用于通过 Chiaki PS5 串流自动运行《碧蓝幻想 Relin
 压缩包预览窗口中运行 EXE。发行包中的 `GBFR_AutoReBattle` 文件夹必须保持完整，不能把 EXE
 单独移出来。Chiaki 通常需要用户自行获取，并放在工具能够找到的位置。
 
-源码仓库默认保持私有。上游项目没有公开授权，Chiaki 和 RapidOCR 相关组件也有各自的许可和
-再分发要求。公开仓库或发布二进制前，请先阅读 `PUBLISH_BLOCKERS.md`、`NOTICE.md`、
-`CORRESPONDING_SOURCE.md` 和 `THIRD_PARTY_NOTICES.md`。不要提交 Chiaki 二进制、PSN 数据、
-日志、截图、视频、主机注册信息或本机驱动安装包。
+Chiaki 和 RapidOCR 相关组件有各自的许可和再分发要求。发布二进制前，请阅读
+`NOTICE.md`、`CORRESPONDING_SOURCE.md` 和 `THIRD_PARTY_NOTICES.md`，并按对应许可证提供
+必要的声明和源码。不要提交 Chiaki 二进制、PSN 数据、日志、截图、视频、主机注册信息或
+本机驱动安装包。
 
 ## 第一次使用
 
@@ -48,6 +48,8 @@ Chiaki 串流窗口应保持连接并保持 16:9 比例。不要最小化串流�
 ## 语言和分辨率
 
 识别区域会按 Chiaki 客户区进行归一化。建议使用 16:9 的 360P、540P、720P 或 1080P 档位。
+低分辨率尤其是 360P/540P 下，串流压缩和文字尺寸会明显降低 OCR 稳定性，实际使用体验
+可能不佳；正式挂机建议优先使用 720P 或更高分辨率。
 调整 Chiaki 窗口大小后，建议先暂停或停止自动化，等待工具重新计算客户区并重新捕获画面，再继续运行。
 窗口过小、比例失真或画面被遮挡都会降低 OCR 准确率。
 
@@ -120,5 +122,7 @@ python -m pytest -q
 
 ## 许可和声明
 
-当前没有向公众授予本衍生源码的使用许可。请保持仓库私有，除非已经取得权利人的明确授权。
-详情请阅读 `NOTICE.md`、`SECURITY.md`、`PUBLISH_BLOCKERS.md` 和 `THIRD_PARTY_NOTICES.md`。
+本项目不替第三方组件授予额外许可。使用、修改或再分发时，请同时遵守项目自身及 Chiaki、
+RapidOCR、OCR 模型和其他依赖的适用许可证。详情请阅读 `NOTICE.md`、`SECURITY.md`、
+`PUBLISH_BLOCKERS.md` 和 `THIRD_PARTY_NOTICES.md`。工具不保证适用于所有分辨率、Chiaki
+版本或游戏客户端配置。

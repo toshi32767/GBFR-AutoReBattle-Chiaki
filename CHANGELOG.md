@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added a main-panel tool UI language selector with Chinese (default), Japanese,
+  and English display modes. The selection is applied with its own confirmation
+  button and is stored independently from the game OCR language setting.
+- Added a visible low-resolution warning to the user documentation; 720p or
+  higher is recommended for unattended use because 360p/540p OCR can be less
+  stable.
+- Updated public-repository wording to use neutral third-party license and
+  redistribution notices rather than private-repository-only guidance.
 - README now defaults to Simplified Chinese with a direct English switch link;
   added `README.en.md` with matching setup, development, customization, and
   privacy guidance.
