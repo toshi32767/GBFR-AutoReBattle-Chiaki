@@ -26,6 +26,12 @@ the main panel.
    optional and is only needed for duplicate physical-controller input.
 6. Click `启动自动重战`. `F2` stops immediately and `F3` pauses/resumes.
 
+The `工具界面语言` selector at the top right of the main panel switches the
+tool display between Simplified Chinese, Japanese, and English. Click
+`应用界面` to apply it. This setting only translates the tool controls; the
+separate `游戏界面语言` setting controls the OCR route and must be applied
+independently with `应用语言`.
+
 Keep the Chiaki stream connected, visible, non-minimized, and at a 16:9 aspect
 ratio. Supported resolution presets are 360p, 540p, 720p, and 1080p. OCR
 stability and the user experience can be poor at 360p/540p because streamed

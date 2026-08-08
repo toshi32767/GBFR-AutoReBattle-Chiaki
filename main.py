@@ -8998,8 +8998,7 @@ def run_unified_gui(args) -> int:
                         if source is None:
                             source = str(child.cget("text"))
                             setattr(child, "_gbfr_i18n_source", source)
-                        if source in translation:
-                            child.configure(text=translation[source])
+                        child.configure(text=translation.get(source, source))
                 translate_tree(child)
 
         translate_tree(root)
