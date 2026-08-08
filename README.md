@@ -1,114 +1,91 @@
 # GBFR AutoReBattle - Chiaki
 
-Windows automation tool for **Granblue Fantasy: Relink** through a Chiaki PS5
-Remote Play stream. It captures the Chiaki stream, uses OCR and image checks to
-identify the town, battle, and result phases, and sends controller input through
-the configured foreground or virtual-controller backend.
+Windows 工具，用于通过 Chiaki PS5 串流自动运行《碧蓝幻想 Relink》的自动重战流程。
 
-This is a private fan utility. It is not affiliated with Cygames, Sony,
-PlayStation, or Chiaki. Use it at your own risk and follow the game and service
-terms.
+**[English README](README.en.md)**
 
-## Download Or Source
+> 本项目是私人使用的同人辅助工具，与 Cygames、Sony、PlayStation 或 Chiaki 没有任何关联。
+> 请自行承担使用风险，并遵守游戏及相关服务条款。
 
-End users should download a complete Windows release ZIP. Extract the entire
-ZIP to a normal folder, keep the `GBFR_AutoReBattle` directory beside the
-launcher, and do not run the EXE from inside the ZIP preview. Chiaki itself is
-not included in this source repository; obtain a compatible Chiaki build
-separately and place it where the launcher can find it.
+## 下载包和源码
 
-This repository is intentionally private. The upstream project does not expose
-a redistribution license, and Chiaki has separate AGPL obligations. Read
-`PUBLISH_BLOCKERS.md`, `NOTICE.md`, `CORRESPONDING_SOURCE.md`, and
-`THIRD_PARTY_NOTICES.md` before publishing a binary or making the repository
-public. Never commit a Chiaki binary, PSN data, runtime logs, screenshots from a
-private session, or a local driver installer.
+普通用户应下载完整的 Windows ZIP：完整解压到普通文件夹后，再运行启动脚本；不要直接在
+压缩包预览窗口中运行 EXE。发行包中的 `GBFR_AutoReBattle` 文件夹必须保持完整，不能把 EXE
+单独移出来。Chiaki 通常需要用户自行获取，并放在工具能够找到的位置。
 
-## First Run
+源码仓库默认保持私有。上游项目没有公开授权，Chiaki 和 RapidOCR 相关组件也有各自的许可和
+再分发要求。公开仓库或发布二进制前，请先阅读 `PUBLISH_BLOCKERS.md`、`NOTICE.md`、
+`CORRESPONDING_SOURCE.md` 和 `THIRD_PARTY_NOTICES.md`。不要提交 Chiaki 二进制、PSN 数据、
+日志、截图、视频、主机注册信息或本机驱动安装包。
 
-1. Start `启动工具.cmd` and accept the normal Windows administrator prompt.
-2. Set the Chiaki executable path, or use the automatic search/browse button.
-3. Start Chiaki, connect to the PS5, and leave the game stream open.
-4. Click `一键同步输入配置` once to read the current Chiaki keyboard mapping.
-5. Choose `自动识别`, `简体中文`, or `日文` for the game language. Automatic
-   mode selects a reliable marker and keeps the matching OCR route.
-6. For background operation, enable `后台运行` and click `检查后台环境`.
-   Install the requested ViGEmBus component if it is missing. HidHide is
-   optional and is only needed when a physical controller causes duplicate
-   input.
-7. Click `启动自动重战`. The same button becomes the stop control while the
-   task is running. `F2` is the emergency stop; `F3` pauses and resumes while
-   releasing automated input.
+## 第一次使用
 
-Keep Chiaki connected and preserve its 16:9 aspect ratio. Do not minimize the
-stream window: some Chiaki/OpenGL configurations stop presenting frames when
-minimized. Background mode allows other windows to cover Chiaki, but it still
-needs a live, non-minimized stream. If the stream window is closed and reopened,
-the automation can rebind to the new matching stream window.
+1. 双击 `启动工具.cmd`，接受正常的 Windows 管理员权限提示。
+2. 设置 Chiaki 程序路径，或者使用自动查找/浏览按钮。
+3. 启动 Chiaki，连接 PS5，并进入游戏串流画面。
+4. 点击一次 `一键同步输入配置`，读取当前 Chiaki 的键位映射。
+5. 在 `游戏界面语言` 中选择 `自动识别`、`简体中文` 或 `日文`。
+6. 需要后台运行时，勾选 `后台运行`，再点击 `检查后台环境`。缺少 ViGEmBus 时，按界面提示
+   单独安装；HidHide 只有在实体手柄产生重复输入时才需要。
+7. 点击 `启动自动重战`。运行期间该按钮会变为停止按钮；任何时候可以按 `F2` 紧急停止，
+   按 `F3` 暂停/继续。
 
-## What The Tool Handles
+Chiaki 串流窗口应保持连接并保持 16:9 比例。不要最小化串流窗口，因为部分 Chiaki/OpenGL
+配置在最小化后会停止提供画面。后台模式允许其他窗口覆盖 Chiaki，但仍需要 Chiaki 窗口存在且
+没有最小化。Chiaki 窗口被关闭并重新打开后，工具可以尝试重新绑定新的串流窗口。
 
-- Town flow: move to the task center, interact with the NPC, accept the saved
-  task, and enter battle.
-- Battle flow: forward movement, skill checks, lock-on/search strategies, and
-  resolution-aware frame capture.
-- Result flow: enable/reconfirm rebattle, handle continue prompts in Chinese or
-  Japanese, and perform the required Cross/Box/Moon actions only in result
-  contexts.
-- Recovery flow: reconnect Chiaki when configured, return to a recognized town,
-  battle, or result phase, and hand control back to the corresponding state
-  machine. Stopping the task clears the automation state so a later normal
-  rebattle run does not inherit a stale phase.
-- Ability reroll: an independent feature with its own configuration window,
-  threshold combinations, star calculation, journal, and qualified-result
-  notification.
-- Session statistics: completed battles and timing are stored locally under
-  `%LOCALAPPDATA%\GBFR-AutoReBattle\logs`.
+## 功能范围
 
-## Resolution And Language
+- **主城流程**：移动到任务中心、与 NPC 对话、承接任务并进入战斗。
+- **战斗流程**：移动、技能状态监控、锁定/索敌方案和分辨率适配截图。
+- **结算流程**：识别再次挑战、继续和确认提示，按当前语言和页面状态发送 Cross、Box、Moon。
+- **恢复流程**：配置后可重连 Chiaki，识别主城、战斗或结算状态，并回到对应状态机。
+- **能力提升重抽**：独立于自动重战，支持属性、星数、组合阈值、MSP 停止条件、自动覆盖和词条记录。
+- **挂机统计**：记录完成场数和每场耗时，保存在本机 `%LOCALAPPDATA%\GBFR-AutoReBattle\logs`。
 
-The recognition regions are normalized to the Chiaki client area. Use one of
-the supported 16:9 presets when possible: 360p, 540p, 720p, or 1080p. If the
-Chiaki client is resized during a run, stop or pause briefly and let the tool
-rebind/calculate the new client area before continuing. Very small or distorted
-windows reduce OCR accuracy even when the aspect ratio is correct.
+停止自动重战后，工具会清理当前状态机，避免之后启动普通重战时继承旧流程状态。
 
-Chinese and Japanese use the same phase transitions and input decisions, while
-their OCR routes and fallback image checks differ. Do not mix a manually forced
-language route with the other client language.
+## 语言和分辨率
 
-## Ability Reroll
+识别区域会按 Chiaki 客户区进行归一化。建议使用 16:9 的 360P、540P、720P 或 1080P 档位。
+调整 Chiaki 窗口大小后，建议先暂停或停止自动化，等待工具重新计算客户区并重新捕获画面，再继续运行。
+窗口过小、比例失真或画面被遮挡都会降低 OCR 准确率。
 
-Open the independent ability-reroll configuration from the main panel. Select
-one to four attributes, set per-attribute minimum stars, total-star thresholds,
-alternative accepted combinations, MSP stop rules, and whether a qualified
-result should be automatically overwritten. The journal records recognized
-attributes and calculated stars; the table view is intended for discovering
-OCR variants and validating new wording before changing matching rules.
+中文和日文的业务阶段与按键决策保持一致，但 OCR 模型和低分辨率视觉兜底不同。不要在中文客户端
+上强制使用日文 OCR，也不要把两种客户端的识别日志混在一起分析。
 
-The reroll state machine is separate from normal rebattle. Stop it before
-starting normal rebattle, and use its clear-history action only when old journal
-data is no longer needed.
+## 能力提升重抽
 
-## Troubleshooting
+从主界面打开独立的能力提升配置窗口。可以选择 1 到 4 个属性，设置每项最低星数、总星数阈值、
+多组可接受组合、MSP 停止条件，以及符合条件后是否自动覆盖。词条记录会保存识别到的属性、数值
+和计算星数，表格窗口可用于检查 OCR 变体和补充匹配规则。
 
-- No frame is detected: confirm Chiaki is connected, not minimized, and that the
-  captured stream title/path is correct. Use the recapture action after a
-  window resize or replacement.
-- Background mode fails: click `检查后台环境`, install only the missing
-  component, then restart the tool if Windows requests it.
-- Input goes in the wrong direction: use the reverse-movement option only after
-  verifying the Chiaki mapping, then restart automation.
-- The log stops at a transition: stop with `F2`, capture the relevant log and
-  screenshot with PSN/account/network data removed, and include resolution,
-  language, Chiaki version, Windows version, and the exact reproduction steps.
+能力提升重抽和普通自动重战使用独立状态机。停止重抽后，再启动普通自动重战；不要让两个任务
+同时运行。历史记录位于 `%LOCALAPPDATA%\GBFR-AutoReBattle\logs`，确认不再需要后再使用清除历史功能。
 
-Runtime logs and settings are local machine data. Do not upload them unchanged:
-they may contain account identifiers, host addresses, or authorization URLs.
+## 常见问题
 
-## Development
+### 没有识别到画面
 
-Requirements: Windows 10/11, PowerShell 7, and Python 3.10 or later.
+确认 Chiaki 已连接、串流窗口没有最小化、窗口标题/路径正确。窗口被替换或调整大小后，使用
+界面中的重新捕获操作。
+
+### 后台运行失败
+
+先点击 `检查后台环境`，只安装缺少的组件。Windows 要求重启时，重启后再启动工具。
+
+### 角色移动方向相反
+
+先核对 Chiaki 键位映射；确认映射无误后，再勾选 `反向移动方向`，然后重新启动自动重战。
+
+### 日志停在某个页面
+
+按 `F2` 停止，保存相关日志和截图，并注明 Windows 版本、Chiaki 版本、语言、分辨率和复现步骤。
+上传前必须删除 AccountID、主机地址、OAuth 回调地址、授权码及其他私人信息。
+
+## 开发和修改
+
+开发环境：Windows 10/11、PowerShell 7、Python 3.10 或更高版本。
 
 ```powershell
 py -3.10 -m venv .venv
@@ -118,36 +95,30 @@ python .\main.py --diagnostics
 python .\main.py --gui
 ```
 
-`Shapely` is required by the vendored RapidOCR detector and is declared in
-`requirements.txt`. The diagnostics command reports missing runtime packages
-individually.
+`Shapely` 是内置 RapidOCR 检测器的依赖，已经列在 `requirements.txt` 中。可以用诊断命令检查
+OCR 和后台输入依赖是否完整。
 
-The main orchestration remains in `main.py`; the smaller responsibilities are
-under `module/`:
+主要修改位置：
 
-- `module/ability_reroll.py`: independent ability-reroll state and matching;
-- `module/controller.py`: foreground/background controller input;
-- `module/rapidocr_onnxruntime/`: bundled OCR runtime and models;
-- `module/psn_account.py`: PSN AccountID helper;
-- `scripts/`: development, verification, and release helpers;
-- `tests/`: focused state-machine and reroll tests.
+- `main.py`：主界面、阶段状态机、Chiaki 捕获、自动重战主流程；
+- `module/ability_reroll.py`：能力提升重抽和词条匹配；
+- `module/controller.py`：前台/后台控制器输入；
+- `module/rapidocr_onnxruntime/`：OCR 运行时和模型；
+- `module/psn_account.py`：PSN AccountID 辅助流程；
+- `scripts/`：开发、验证和发行脚本；
+- `tests/`：状态机和能力提升测试。
 
-Run focused checks with:
+修改识别逻辑时，必须保留中日文的阶段保护，避免在主城、战斗、结算和恢复流程之间异步串入
+不相关动作；同时补充测试或截图样本，并在 `CHANGELOG.md` 记录用户可见变化。
 
 ```powershell
 python -m pytest -q
 .\scripts\verify_publish_tree.ps1
 ```
 
-When changing recognition, preserve the Chinese and Japanese phase routes,
-keep actions guarded by the current phase, add a fixture or focused test, and
-record the user-visible behavior in `CHANGELOG.md`. Use the existing release
-script for packaging; do not commit `build/`, `dist/`, release folders, ZIPs,
-or local runtime data.
+不要提交 `build/`、`dist/`、`release*/`、ZIP、Chiaki 文件、日志和本机运行数据。
 
-## License And Notices
+## 许可和声明
 
-No public license is granted for this derivative source. Keep this repository
-private unless the rights holder grants permission. See `NOTICE.md`,
-`SECURITY.md`, `PUBLISH_BLOCKERS.md`, and `THIRD_PARTY_NOTICES.md` for the
-current restrictions and notices.
+当前没有向公众授予本衍生源码的使用许可。请保持仓库私有，除非已经取得权利人的明确授权。
+详情请阅读 `NOTICE.md`、`SECURITY.md`、`PUBLISH_BLOCKERS.md` 和 `THIRD_PARTY_NOTICES.md`。

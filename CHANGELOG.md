@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- README now defaults to Simplified Chinese with a direct English switch link;
+  added `README.en.md` with matching setup, development, customization, and
+  privacy guidance.
 - Source repository documentation: replaced the short README with a complete
   private-source guide covering download/package layout, first-run setup,
   foreground/background operation, language and resolution choices, ability
